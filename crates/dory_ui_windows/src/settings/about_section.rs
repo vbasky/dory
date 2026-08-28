@@ -28,11 +28,6 @@ impl Render for AboutSection {
         const AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
         const LICENSE: &str = env!("CARGO_PKG_LICENSE");
 
-        #[cfg(debug_assertions)]
-        const PROFILE: &str = "debug";
-        #[cfg(not(debug_assertions))]
-        const PROFILE: &str = "release";
-
         // Rendered through `img` (full color) rather than the monochrome icon
         // path so the channel-specific mark — including nightly — shows in color.
         let mark_path = match dory_core::ReleaseChannel::current() {
@@ -75,10 +70,16 @@ impl Render for AboutSection {
                                         .flex_col()
                                         .gap_1()
                                         .child(Headline::new("Dory").xl())
-                                        .child(MonoCaption::new(format!(
-                                            "{} ({})",
-                                            VERSION, PROFILE
-                                        ))),
+                                        .child(MonoCaption::new({
+                                            #[cfg(debug_assertions)]
+                                            {
+                                                format!("{VERSION} (debug)")
+                                            }
+                                            #[cfg(not(debug_assertions))]
+                                            {
+                                                VERSION.to_string()
+                                            }
+                                        })),
                                 ),
                         )
                         .child(
