@@ -318,24 +318,42 @@ impl Sidebar {
                         profile_children.extend(db_item.children);
                     }
                 } else if !named_items.is_empty() {
-                    // Put the connected database's schemas (public / Tables / …)
-                    // directly under the profile so tables are visible without
-                    // opening Databases → postgres → public.
-                    let current_name = schema.current_database();
-                    let (current_items, other_items): (Vec<_>, Vec<_>) =
-                        named_items.into_iter().partition(|item| {
-                            matches!(
-                                parse_node_id(item.id.as_ref()),
-                                Some(SchemaNodeId::Database { name, .. })
-                                    if current_name == Some(name.as_str())
-                            )
-                        });
-                    for db_item in current_items {
-                        profile_children.extend(db_item.children);
-                    }
-                    if !other_items.is_empty() {
+                    // Always render the connected database's schemas on the
+                    // profile itself. Tables then appear under Localhost →
+                    // public → Tables without opening a Databases folder.
+                    if let Some(current) = schema.current_database() {
+                        profile_children.extend(Self::build_schema_children(
+                            profile_id,
+                            current,
+                            Some(current),
+                            schema,
+                            &connected.table_details,
+                            &connected.schema_types,
+                            &connected.schema_indexes,
+                            &connected.schema_foreign_keys,
+                            &connected.schema_routines,
+                            supports_routines,
+                            &connected.dependents_cache,
+                        ));
+                        let other_items: Vec<_> = named_items
+                            .into_iter()
+                            .filter(|item| {
+                                !matches!(
+                                    parse_node_id(item.id.as_ref()),
+                                    Some(SchemaNodeId::Database { name, .. })
+                                        if name == current
+                                )
+                            })
+                            .collect();
+                        if !other_items.is_empty() {
+                            profile_children.push(Self::build_databases_folder_item(
+                                profile_id,
+                                other_items,
+                            ));
+                        }
+                    } else {
                         profile_children
-                            .push(Self::build_databases_folder_item(profile_id, other_items));
+                            .push(Self::build_databases_folder_item(profile_id, named_items));
                     }
                 }
             } else {

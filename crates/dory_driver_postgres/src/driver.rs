@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use dory_core::secrecy::{ExposeSecret, SecretString};
@@ -1015,14 +1015,30 @@ struct PostgresConnectParams<'a> {
 /// - `"allow"` / `"prefer"` — try TLS first, fall back to plain
 /// - `"require"` — TLS required, self-signed certs accepted
 /// - `"verify-ca"` / `"verify-full"` — TLS required with certificate validation
+fn postgres_client_config(params: &PostgresConnectParams) -> postgres::Config {
+    let mut config = postgres::Config::new();
+    config
+        .host(params.host)
+        .port(params.port)
+        .user(params.user)
+        .dbname(params.database)
+        .connect_timeout(Duration::from_secs(30));
+    if !params.password.is_empty() {
+        config.password(params.password);
+    }
+    config
+}
+
 fn connect_postgres(params: &PostgresConnectParams) -> Result<Client, DbError> {
-    let conn_string = format!(
-        "host={} port={} user={} password={} dbname={} connect_timeout=30",
-        params.host, params.port, params.user, params.password, params.database
-    );
+    // Use postgres::Config instead of a libpq keyword string. An empty
+    // `password=` in a keyword string can swallow the following `dbname=`
+    // parameter, so the server falls back to the role name as the database
+    // (empty schema, no tables).
+    let config = postgres_client_config(params);
 
     match params.ssl_mode {
-        "disable" => Client::connect(&conn_string, NoTls)
+        "disable" => config
+            .connect(NoTls)
             .map_err(|e| format_pg_error(&e, params.host, params.port)),
 
         "allow" | "prefer" => {
@@ -1036,9 +1052,11 @@ fn connect_postgres(params: &PostgresConnectParams) -> Result<Client, DbError> {
 
             let tls = MakeTlsConnector::new(connector);
 
-            match Client::connect(&conn_string, tls) {
+            match config.connect(tls) {
                 Ok(client) => Ok(client),
-                Err(_) => Client::connect(&conn_string, NoTls)
+                Err(_) => config
+                    .clone()
+                    .connect(NoTls)
                     .map_err(|e| format_pg_error(&e, params.host, params.port)),
             }
         }
@@ -1053,7 +1071,8 @@ fn connect_postgres(params: &PostgresConnectParams) -> Result<Client, DbError> {
 
             let tls = MakeTlsConnector::new(connector);
 
-            Client::connect(&conn_string, tls)
+            config
+                .connect(tls)
                 .map_err(|e| format_pg_error(&e, params.host, params.port))
         }
 
@@ -1067,7 +1086,8 @@ fn connect_postgres(params: &PostgresConnectParams) -> Result<Client, DbError> {
 
             let tls = MakeTlsConnector::new(connector);
 
-            Client::connect(&conn_string, tls)
+            config
+                .connect(tls)
                 .map_err(|e| format_pg_error(&e, params.host, params.port))
         }
 
@@ -1082,9 +1102,11 @@ fn connect_postgres(params: &PostgresConnectParams) -> Result<Client, DbError> {
 
             let tls = MakeTlsConnector::new(connector);
 
-            match Client::connect(&conn_string, tls) {
+            match config.connect(tls) {
                 Ok(client) => Ok(client),
-                Err(_) => Client::connect(&conn_string, NoTls)
+                Err(_) => config
+                    .clone()
+                    .connect(NoTls)
                     .map_err(|e| format_pg_error(&e, params.host, params.port)),
             }
         }
@@ -6409,6 +6431,48 @@ mod tests {
                 FieldExportTransform::None
             ),
             "non-URI mode must return None"
+        );
+    }
+
+    #[test]
+    fn localhost_driver_schema_lists_documents() {
+        use dory_core::{Connection, ConnectionProfile, DbConfig, DbDriver};
+
+        let profile = ConnectionProfile::new(
+            "Localhost",
+            DbConfig::Postgres {
+                use_uri: false,
+                uri: None,
+                host: "localhost".to_string(),
+                port: 5432,
+                user: "vikram".to_string(),
+                database: "postgres".to_string(),
+                ssl_mode: Some("disable".to_string()),
+                ssl_root_cert_path: None,
+                ssl_client_cert_path: None,
+                ssl_client_key_path: None,
+                ssh_tunnel: None,
+                ssh_tunnel_profile_id: None,
+            },
+        );
+        let driver = PostgresDriver::new();
+        let connection = match driver.connect_with_secrets(&profile, None, None) {
+            Ok(connection) => connection,
+            Err(error) => {
+                eprintln!("skip localhost driver schema: {error}");
+                return;
+            }
+        };
+        let schema = connection.schema().expect("schema()");
+        assert_eq!(schema.current_database(), Some("postgres"));
+        let nested: Vec<String> = schema
+            .schemas()
+            .iter()
+            .flat_map(|item| item.tables.iter().map(|table| table.name.clone()))
+            .collect();
+        assert!(
+            nested.iter().any(|name| name == "documents"),
+            "documents missing from postgres.public, got {nested:?}"
         );
     }
 }
