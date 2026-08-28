@@ -656,6 +656,7 @@ impl Sidebar {
                 .schemas()
                 .iter()
                 .any(|schema| !schema.tables.is_empty())
+                || !snapshot.tables().is_empty()
         };
 
         if connected.schema.as_ref().is_some_and(snapshot_has_tables)

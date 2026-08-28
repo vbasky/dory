@@ -29,15 +29,51 @@ impl SecretStore for NoopSecretStore {
 }
 
 const SERVICE_NAME: &str = "dory";
+const LEGACY_SERVICE_NAME: &str = "dbflux";
 
-fn keyring_get(secret_ref: &str) -> Result<Option<SecretString>, DbError> {
-    let entry = keyring::Entry::new(SERVICE_NAME, secret_ref)
+fn keyring_get_from(
+    service: &str,
+    secret_ref: &str,
+) -> Result<Option<SecretString>, DbError> {
+    let entry = keyring::Entry::new(service, secret_ref)
         .map_err(|e| DbError::IoError(std::io::Error::other(e.to_string())))?;
 
     match entry.get_password() {
         Ok(password) => Ok(Some(SecretString::from(password))),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(DbError::IoError(std::io::Error::other(e.to_string()))),
+    }
+}
+
+fn legacy_secret_ref(secret_ref: &str) -> Option<String> {
+    secret_ref
+        .strip_prefix("dory:")
+        .map(|rest| format!("dbflux:{rest}"))
+}
+
+fn migrate_legacy_secret(secret_ref: &str) -> Result<Option<SecretString>, DbError> {
+    let Some(legacy_ref) = legacy_secret_ref(secret_ref) else {
+        return Ok(None);
+    };
+
+    let Some(secret) = keyring_get_from(LEGACY_SERVICE_NAME, &legacy_ref)? else {
+        return Ok(None);
+    };
+
+    use secrecy::ExposeSecret;
+    if let Ok(entry) = keyring::Entry::new(SERVICE_NAME, secret_ref)
+        && let Err(error) = entry.set_password(secret.expose_secret())
+    {
+        log::warn!("Failed to copy legacy keychain secret into dory: {error}");
+    }
+
+    Ok(Some(secret))
+}
+
+fn keyring_get(secret_ref: &str) -> Result<Option<SecretString>, DbError> {
+    match keyring_get_from(SERVICE_NAME, secret_ref)? {
+        Some(secret) => Ok(Some(secret)),
+        None => migrate_legacy_secret(secret_ref),
     }
 }
 
@@ -178,6 +214,15 @@ pub fn create_secret_store() -> Box<dyn SecretStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_secret_ref_rewrites_dory_prefix() {
+        assert_eq!(
+            legacy_secret_ref("dory:conn:abc"),
+            Some("dbflux:conn:abc".into())
+        );
+        assert_eq!(legacy_secret_ref("other:conn:abc"), None);
+    }
 
     #[test]
     fn proxy_secret_ref_format() {

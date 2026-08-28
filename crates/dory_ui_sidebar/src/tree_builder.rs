@@ -835,6 +835,7 @@ impl Sidebar {
                 TreeItem::new(
                     SchemaNodeId::Schema {
                         profile_id,
+                        database: target_database.unwrap_or(database_name).to_string(),
                         name: db_schema.name.clone(),
                     }
                     .to_string(),
@@ -1597,6 +1598,17 @@ fn schema_has_tables(snapshot: &dory_core::SchemaSnapshot) -> bool {
         || !snapshot.tables().is_empty()
 }
 
+fn database_is_current(
+    connected: &dory_core::ConnectedProfile,
+    schema: &dory_core::SchemaSnapshot,
+    db_name: &str,
+    marked_current: bool,
+) -> bool {
+    marked_current
+        || schema.current_database() == Some(db_name)
+        || connected.active_database.as_deref() == Some(db_name)
+}
+
 fn tables_for_schema(
     snapshot: &dory_core::SchemaSnapshot,
     db_schema: &dory_core::DbSchemaInfo,
@@ -1639,6 +1651,8 @@ fn resolve_db_children(
     db_name: &str,
     is_current: bool,
 ) -> Vec<TreeItem> {
+    let is_current = database_is_current(connected, schema, db_name, is_current);
+
     if uses_lazy_loading {
         if let Some(db_schema) = connected.database_schemas.get(db_name) {
             if is_document_db {
@@ -2410,6 +2424,7 @@ fn build_schema_tables_folder(
         TreeItem::new(
             SchemaNodeId::TablesFolder {
                 profile_id,
+                database: target_database.unwrap_or("").to_string(),
                 schema: schema_name.to_string(),
             }
             .to_string(),
@@ -2454,6 +2469,7 @@ fn build_schema_views_folder(
         TreeItem::new(
             SchemaNodeId::ViewsFolder {
                 profile_id,
+                database: target_database.unwrap_or("").to_string(),
                 schema: schema_name.to_string(),
             }
             .to_string(),
