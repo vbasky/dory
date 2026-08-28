@@ -748,6 +748,19 @@ impl Sidebar {
                         message,
                         is_error: false,
                     });
+                    if app_state
+                        .read(cx)
+                        .connections()
+                        .get(&profile_id)
+                        .is_some_and(|connected| connected.schema.is_none())
+                    {
+                        sidebar.pending_toast = Some(PendingToast {
+                            message: crate::labels::load_schema_failed_label(
+                                "the driver returned no schema snapshot",
+                            ),
+                            is_error: true,
+                        });
+                    }
                     sidebar.refresh_schema_if_tables_empty(profile_id, cx);
                     sidebar.refresh_tree(cx);
                 });
