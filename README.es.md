@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="resources/branding/stable/mark-256.png" alt="Dory" width="128" height="128">
+</p>
+
 # Dory
 
 [English](README.md) · **Español**
@@ -11,8 +15,6 @@ Una plataforma de datos extensible y orientada al teclado, distribuida como un c
 Dory es un cliente de escritorio de código abierto con drivers integrados para bases de datos relacionales y no relacionales. Sus contratos core son agnósticos al driver, y los drivers externos pueden integrarse por RPC.
 
 El cliente se enfoca en rendimiento, una UX limpia y flujos de trabajo orientados al teclado. El objetivo a largo plazo es un cliente totalmente open-source para cada base de datos con la que trabajes.
-
-![Dory](resources/dory.png)
 
 ## Documentación
 
