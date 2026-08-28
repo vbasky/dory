@@ -691,6 +691,9 @@ impl ConnectionManager {
     ) {
         let id = profile.id;
         let mutation_policy = self.policy_resolver.resolve(&profile, is_mcp_actor);
+        let active_database = schema
+            .as_ref()
+            .and_then(|snapshot| snapshot.current_database().map(str::to_string));
         self.connections.insert(
             id,
             ConnectedProfile {
@@ -706,7 +709,7 @@ impl ConnectionManager {
                 schema_foreign_keys: HashMap::new(),
                 schema_routines: HashMap::new(),
                 dependents_cache: HashMap::new(),
-                active_database: None,
+                active_database,
                 redis_key_cache: RedisKeyCache::default(),
                 database_connections: HashMap::new(),
                 proxy_tunnel,

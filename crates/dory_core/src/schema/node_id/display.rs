@@ -118,8 +118,12 @@ fn fmt_connection_scope(id: &SchemaNodeId, f: &mut fmt::Formatter<'_>) -> fmt::R
         } => {
             write!(f, "{}|{}|{}", P_LOADING, profile_id, database)
         }
-        SchemaNodeId::Schema { profile_id, name } => {
-            write!(f, "{}|{}|{}", P_SCHEMA, profile_id, name)
+        SchemaNodeId::Schema {
+            profile_id,
+            database,
+            name,
+        } => {
+            write!(f, "{}|{}|{}|{}", P_SCHEMA, profile_id, database, name)
         }
         _ => unreachable!("fmt_connection_scope called with an unexpected variant"),
     }
@@ -127,11 +131,27 @@ fn fmt_connection_scope(id: &SchemaNodeId, f: &mut fmt::Formatter<'_>) -> fmt::R
 
 fn fmt_folder_variants(id: &SchemaNodeId, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match id {
-        SchemaNodeId::TablesFolder { profile_id, schema } => {
-            write!(f, "{}|{}|{}", P_TABLES_FOLDER, profile_id, schema)
+        SchemaNodeId::TablesFolder {
+            profile_id,
+            database,
+            schema,
+        } => {
+            write!(
+                f,
+                "{}|{}|{}|{}",
+                P_TABLES_FOLDER, profile_id, database, schema
+            )
         }
-        SchemaNodeId::ViewsFolder { profile_id, schema } => {
-            write!(f, "{}|{}|{}", P_VIEWS_FOLDER, profile_id, schema)
+        SchemaNodeId::ViewsFolder {
+            profile_id,
+            database,
+            schema,
+        } => {
+            write!(
+                f,
+                "{}|{}|{}|{}",
+                P_VIEWS_FOLDER, profile_id, database, schema
+            )
         }
         SchemaNodeId::TypesFolder {
             profile_id,

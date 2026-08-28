@@ -37,16 +37,19 @@ pub enum SchemaNodeId {
     },
     Schema {
         profile_id: Uuid,
+        database: String,
         name: String,
     },
 
     // Folder variants
     TablesFolder {
         profile_id: Uuid,
+        database: String,
         schema: String,
     },
     ViewsFolder {
         profile_id: Uuid,
+        database: String,
         schema: String,
     },
     TypesFolder {
@@ -689,14 +692,47 @@ mod tests {
         });
         roundtrip(SchemaNodeId::Schema {
             profile_id: uuid,
+            database: "mydb".into(),
             name: "public".into(),
         });
+        assert_ne!(
+            SchemaNodeId::Schema {
+                profile_id: uuid,
+                database: "postgres".into(),
+                name: "public".into(),
+            }
+            .to_string(),
+            SchemaNodeId::Schema {
+                profile_id: uuid,
+                database: "aeris".into(),
+                name: "public".into(),
+            }
+            .to_string(),
+            "schema nodes in different databases must not share an ID"
+        );
+        assert_ne!(
+            SchemaNodeId::TablesFolder {
+                profile_id: uuid,
+                database: "postgres".into(),
+                schema: "public".into(),
+            }
+            .to_string(),
+            SchemaNodeId::TablesFolder {
+                profile_id: uuid,
+                database: "aeris".into(),
+                schema: "public".into(),
+            }
+            .to_string(),
+            "tables folders in different databases must not share an ID"
+        );
         roundtrip(SchemaNodeId::TablesFolder {
             profile_id: uuid,
+            database: "mydb".into(),
             schema: "public".into(),
         });
         roundtrip(SchemaNodeId::ViewsFolder {
             profile_id: uuid,
+            database: "mydb".into(),
             schema: "public".into(),
         });
         roundtrip(SchemaNodeId::TypesFolder {
