@@ -1553,8 +1553,15 @@ fn build_named_db_children(
     uses_lazy_loading: bool,
 ) -> Vec<TreeItem> {
     let mut named_db_items: Vec<TreeItem> = Vec::new();
+    let mut databases: Vec<&dory_core::DatabaseInfo> = schema.databases().iter().collect();
+    databases.sort_by(|left, right| {
+        right
+            .is_current
+            .cmp(&left.is_current)
+            .then_with(|| left.name.cmp(&right.name))
+    });
 
-    for db in schema.databases() {
+    for db in databases {
         let is_pending = state.is_operation_pending(profile_id, Some(&db.name));
         let is_active_db = connected.active_database.as_deref() == Some(&db.name);
 
