@@ -2,6 +2,19 @@
 
 All notable changes to Dory will be documented in this file.
 
+## [0.1.1] - 2026-08-28
+
+
+### Fixed
+
+* Empty Postgres password must not drop the target database
+* Identify the connections root by id, not a legacy folder name
+* Put current-database tables directly under the connection
+* Show the current postgres database first so tables are visible
+* Never read dbflux Keychain entries from Dory
+* Keep tables visible across postgres databases
+
+
 ## [0.1.0] - 2026-08-28
 
 

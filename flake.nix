@@ -48,7 +48,7 @@
           # Import default.nix with crane support
           dory = import ./default.nix {
             inherit pkgs craneLib;
-            version = "0.1.0";
+            version = "0.1.1";
           };
 
           # Source build (current behavior, compiles locally via crane).

@@ -20,7 +20,7 @@
 #define MyAppVersion GetEnv("DORY_APP_VERSION")
 #if MyAppVersion == ""
 #undef MyAppVersion
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.1"
 #endif
 #endif
 #define MyAppPublisher "Dory contributors"
