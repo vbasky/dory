@@ -1,0 +1,504 @@
+//! Repository for cfg_general_settings table in dory.db.
+//!
+//! This table stores the normalized general settings as native columns,
+//! replacing the JSON blob previously stored in app_settings.
+
+use log::info;
+use rusqlite::{Connection, params};
+
+use crate::bootstrap::OwnedConnection;
+use crate::error::StorageError;
+
+/// Repository for managing general settings.
+pub struct GeneralSettingsRepository {
+    conn: OwnedConnection,
+}
+
+impl GeneralSettingsRepository {
+    /// Creates a new repository instance.
+    pub fn new(conn: OwnedConnection) -> Self {
+        Self { conn }
+    }
+
+    /// Borrows the underlying connection.
+    fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Gets the general settings row.
+    pub fn get(&self) -> Result<Option<GeneralSettingsDto>, StorageError> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                r#"
+                SELECT id, theme, restore_session_on_startup, reopen_last_connections,
+                       default_focus_on_startup, max_history_entries, auto_save_interval_ms,
+                       default_refresh_policy, default_refresh_interval_secs,
+                       max_concurrent_background_tasks, auto_refresh_pause_on_error,
+                       auto_refresh_only_if_visible, confirm_dangerous_queries,
+                       dangerous_requires_where, dangerous_requires_preview,
+                       style, schema_snapshot_retention,
+                       object_preview_size_limit_mib, language, ui_font,
+                       theme_mode, dark_theme, light_theme, updated_at
+                FROM cfg_general_settings WHERE id = 1
+                "#,
+            )
+            .map_err(|source| StorageError::Sqlite {
+                path: "dory.db".into(),
+                source,
+            })?;
+
+        let result = stmt.query_row([], |row| {
+            Ok(GeneralSettingsDto {
+                id: row.get(0)?,
+                theme: row.get(1)?,
+                restore_session_on_startup: row.get(2)?,
+                reopen_last_connections: row.get(3)?,
+                default_focus_on_startup: row.get(4)?,
+                max_history_entries: row.get(5)?,
+                auto_save_interval_ms: row.get(6)?,
+                default_refresh_policy: row.get(7)?,
+                default_refresh_interval_secs: row.get(8)?,
+                max_concurrent_background_tasks: row.get(9)?,
+                auto_refresh_pause_on_error: row.get(10)?,
+                auto_refresh_only_if_visible: row.get(11)?,
+                confirm_dangerous_queries: row.get(12)?,
+                dangerous_requires_where: row.get(13)?,
+                dangerous_requires_preview: row.get(14)?,
+                style: row.get(15)?,
+                schema_snapshot_retention: row.get(16)?,
+                object_preview_size_limit_mib: row.get(17)?,
+                language: row.get(18)?,
+                ui_font: row.get(19)?,
+                theme_mode: row.get(20)?,
+                dark_theme: row.get(21)?,
+                light_theme: row.get(22)?,
+                updated_at: row.get(23)?,
+            })
+        });
+
+        match result {
+            Ok(dto) => Ok(Some(dto)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(StorageError::Sqlite {
+                path: "dory.db".into(),
+                source: e,
+            }),
+        }
+    }
+
+    /// Upserts the general settings.
+    pub fn upsert(&self, settings: &GeneralSettingsDto) -> Result<(), StorageError> {
+        self.conn()
+            .execute(
+                r#"
+                INSERT INTO cfg_general_settings (
+                    id, theme, restore_session_on_startup, reopen_last_connections,
+                    default_focus_on_startup, max_history_entries, auto_save_interval_ms,
+                    default_refresh_policy, default_refresh_interval_secs,
+                    max_concurrent_background_tasks, auto_refresh_pause_on_error,
+                    auto_refresh_only_if_visible, confirm_dangerous_queries,
+                    dangerous_requires_where, dangerous_requires_preview,
+                    style, schema_snapshot_retention,
+                    object_preview_size_limit_mib, language, ui_font,
+                    theme_mode, dark_theme, light_theme, updated_at
+                ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, datetime('now'))
+                ON CONFLICT(id) DO UPDATE SET
+                    theme = excluded.theme,
+                    restore_session_on_startup = excluded.restore_session_on_startup,
+                    reopen_last_connections = excluded.reopen_last_connections,
+                    default_focus_on_startup = excluded.default_focus_on_startup,
+                    max_history_entries = excluded.max_history_entries,
+                    auto_save_interval_ms = excluded.auto_save_interval_ms,
+                    default_refresh_policy = excluded.default_refresh_policy,
+                    default_refresh_interval_secs = excluded.default_refresh_interval_secs,
+                    max_concurrent_background_tasks = excluded.max_concurrent_background_tasks,
+                    auto_refresh_pause_on_error = excluded.auto_refresh_pause_on_error,
+                    auto_refresh_only_if_visible = excluded.auto_refresh_only_if_visible,
+                    confirm_dangerous_queries = excluded.confirm_dangerous_queries,
+                    dangerous_requires_where = excluded.dangerous_requires_where,
+                    dangerous_requires_preview = excluded.dangerous_requires_preview,
+                    style = excluded.style,
+                    schema_snapshot_retention = excluded.schema_snapshot_retention,
+                    object_preview_size_limit_mib = excluded.object_preview_size_limit_mib,
+                    language = excluded.language,
+                    ui_font = excluded.ui_font,
+                    theme_mode = excluded.theme_mode,
+                    dark_theme = excluded.dark_theme,
+                    light_theme = excluded.light_theme,
+                    updated_at = datetime('now')
+                "#,
+                params![
+                    settings.theme,
+                    settings.restore_session_on_startup,
+                    settings.reopen_last_connections,
+                    settings.default_focus_on_startup,
+                    settings.max_history_entries,
+                    settings.auto_save_interval_ms,
+                    settings.default_refresh_policy,
+                    settings.default_refresh_interval_secs,
+                    settings.max_concurrent_background_tasks,
+                    settings.auto_refresh_pause_on_error,
+                    settings.auto_refresh_only_if_visible,
+                    settings.confirm_dangerous_queries,
+                    settings.dangerous_requires_where,
+                    settings.dangerous_requires_preview,
+                    settings.style,
+                    settings.schema_snapshot_retention,
+                    settings.object_preview_size_limit_mib,
+                    settings.language,
+                    settings.ui_font,
+                    settings.theme_mode,
+                    settings.dark_theme,
+                    settings.light_theme,
+                ],
+            )
+            .map_err(|source| StorageError::Sqlite {
+                path: "dory.db".into(),
+                source,
+            })?;
+
+        info!("Upserted general settings");
+        Ok(())
+    }
+}
+
+/// DTO for general_settings table.
+#[derive(Debug, Clone)]
+pub struct GeneralSettingsDto {
+    pub id: i64,
+    pub theme: String,
+    pub restore_session_on_startup: i32,
+    pub reopen_last_connections: i32,
+    pub default_focus_on_startup: String,
+    pub max_history_entries: i64,
+    pub auto_save_interval_ms: i64,
+    pub default_refresh_policy: String,
+    pub default_refresh_interval_secs: i32,
+    pub max_concurrent_background_tasks: i64,
+    pub auto_refresh_pause_on_error: i32,
+    pub auto_refresh_only_if_visible: i32,
+    pub confirm_dangerous_queries: i32,
+    pub dangerous_requires_where: i32,
+    pub dangerous_requires_preview: i32,
+    /// Serialized `AppStyle` value: `"default"` or `"compact"`.
+    /// Unknown values fall back to `"default"` at the loader layer.
+    pub style: String,
+    /// Maximum number of auto-captured schema snapshots retained per
+    /// profile/database before older ones are pruned.
+    pub schema_snapshot_retention: i64,
+    /// Largest object size (in MiB) whose bytes may be fetched for an in-app
+    /// object-storage preview.
+    pub object_preview_size_limit_mib: i64,
+    /// The user's language preference: a `dory_i18n::Language` storage
+    /// identifier (for example `"en"`, `"es"`), or an empty string to follow
+    /// the system locale.
+    pub language: String,
+    /// Serialized `FontSetting` value: empty string for the system font, or
+    /// an installed font family name. The loader maps legacy sentinel values
+    /// to the system font.
+    pub ui_font: String,
+    /// `system`, `dark`, or `light`. Unknown values fall back to `system`.
+    pub theme_mode: String,
+    /// Storage id of the dark-appearance palette.
+    pub dark_theme: String,
+    /// Storage id of the light-appearance palette.
+    pub light_theme: String,
+    pub updated_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrations::MigrationRegistry;
+    use crate::sqlite::open_database;
+    use std::sync::Arc;
+
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "dory_repo_general_settings_{}_{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        path
+    }
+
+    #[test]
+    fn upsert_and_get() {
+        let path = temp_db("upsert_get");
+        let conn = open_database(&path).expect("should open");
+        MigrationRegistry::new()
+            .run_all(&conn)
+            .expect("migration should run");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let repo = GeneralSettingsRepository::new(Arc::new(conn));
+
+        let dto = GeneralSettingsDto {
+            id: 1,
+            theme: "light".to_string(),
+            restore_session_on_startup: 0,
+            reopen_last_connections: 1,
+            default_focus_on_startup: "last_tab".to_string(),
+            max_history_entries: 500,
+            auto_save_interval_ms: 3000,
+            default_refresh_policy: "interval".to_string(),
+            default_refresh_interval_secs: 10,
+            max_concurrent_background_tasks: 4,
+            auto_refresh_pause_on_error: 0,
+            auto_refresh_only_if_visible: 1,
+            confirm_dangerous_queries: 0,
+            dangerous_requires_where: 0,
+            dangerous_requires_preview: 1,
+            style: "compact".to_string(),
+            schema_snapshot_retention: 15,
+            object_preview_size_limit_mib: 25,
+            language: String::new(),
+            ui_font: String::new(),
+            theme_mode: "system".to_string(),
+            dark_theme: "dory_dark".to_string(),
+            light_theme: "dory_light".to_string(),
+            updated_at: String::new(),
+        };
+
+        repo.upsert(&dto).expect("should upsert");
+
+        let fetched = repo.get().expect("should get").expect("should exist");
+        assert_eq!(fetched.theme, "light");
+        assert_eq!(fetched.restore_session_on_startup, 0);
+        assert_eq!(fetched.max_history_entries, 500);
+        assert_eq!(fetched.style, "compact");
+        assert_eq!(fetched.schema_snapshot_retention, 15);
+        assert_eq!(fetched.object_preview_size_limit_mib, 25);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn style_round_trips_for_default_and_compact() {
+        for (style_str, label) in [("default", "default"), ("compact", "compact")] {
+            let path = temp_db(&format!("style_roundtrip_{}", label));
+            let conn = open_database(&path).expect("should open");
+            MigrationRegistry::new()
+                .run_all(&conn)
+                .expect("migration should run");
+
+            #[allow(clippy::arc_with_non_send_sync)]
+            let repo = GeneralSettingsRepository::new(Arc::new(conn));
+
+            let dto = GeneralSettingsDto {
+                id: 1,
+                theme: "dark".to_string(),
+                restore_session_on_startup: 1,
+                reopen_last_connections: 0,
+                default_focus_on_startup: "sidebar".to_string(),
+                max_history_entries: 1000,
+                auto_save_interval_ms: 2000,
+                default_refresh_policy: "manual".to_string(),
+                default_refresh_interval_secs: 5,
+                max_concurrent_background_tasks: 8,
+                auto_refresh_pause_on_error: 1,
+                auto_refresh_only_if_visible: 0,
+                confirm_dangerous_queries: 1,
+                dangerous_requires_where: 1,
+                dangerous_requires_preview: 0,
+                style: style_str.to_string(),
+                schema_snapshot_retention: 10,
+                object_preview_size_limit_mib: 10,
+                language: String::new(),
+                ui_font: String::new(),
+                theme_mode: "system".to_string(),
+                dark_theme: "dory_dark".to_string(),
+                light_theme: "dory_light".to_string(),
+                updated_at: String::new(),
+            };
+
+            repo.upsert(&dto).expect("should upsert");
+            let fetched = repo.get().expect("should get").expect("should exist");
+            assert_eq!(
+                fetched.style, style_str,
+                "style round-trip failed for '{}'",
+                label
+            );
+
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn migrated_row_defaults_language_to_empty_string() {
+        // Simulate a pre-migration row where 'language' column is absent (DEFAULT kicks in).
+        // After migration 026 runs, existing rows get the column with '' value, meaning
+        // "follow the system locale" per LanguagePreference::System.
+        let path = temp_db("language_column_default");
+        let conn = open_database(&path).expect("should open");
+        MigrationRegistry::new()
+            .run_all(&conn)
+            .expect("migration should run");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let repo = GeneralSettingsRepository::new(Arc::new(conn));
+        let fetched = repo.get().expect("should get").expect("should exist");
+        assert_eq!(
+            fetched.language, "",
+            "language column default should be the empty string"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migrated_row_defaults_ui_font_to_system_font() {
+        // After migration 027 runs, existing rows get the 'ui_font' column with
+        // the default value (empty string), meaning the platform system font.
+        let path = temp_db("ui_font_column_default");
+        let conn = open_database(&path).expect("should open");
+        MigrationRegistry::new()
+            .run_all(&conn)
+            .expect("migration should run");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let repo = GeneralSettingsRepository::new(Arc::new(conn));
+        let fetched = repo.get().expect("should get").expect("should exist");
+        assert_eq!(
+            fetched.ui_font, "",
+            "ui_font column default should be the empty string (system font)"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ui_font_round_trips_through_upsert() {
+        for (font, label) in [("", "system"), ("Inter", "inter"), ("Menlo", "menlo")] {
+            let path = temp_db(&format!("ui_font_roundtrip_{}", label));
+            let conn = open_database(&path).expect("should open");
+            MigrationRegistry::new()
+                .run_all(&conn)
+                .expect("migration should run");
+
+            #[allow(clippy::arc_with_non_send_sync)]
+            let repo = GeneralSettingsRepository::new(Arc::new(conn));
+
+            let dto = GeneralSettingsDto {
+                id: 1,
+                theme: "dark".to_string(),
+                restore_session_on_startup: 1,
+                reopen_last_connections: 0,
+                default_focus_on_startup: "sidebar".to_string(),
+                max_history_entries: 1000,
+                auto_save_interval_ms: 2000,
+                default_refresh_policy: "manual".to_string(),
+                default_refresh_interval_secs: 5,
+                max_concurrent_background_tasks: 8,
+                auto_refresh_pause_on_error: 1,
+                auto_refresh_only_if_visible: 0,
+                confirm_dangerous_queries: 1,
+                dangerous_requires_where: 1,
+                dangerous_requires_preview: 0,
+                style: "default".to_string(),
+                schema_snapshot_retention: 10,
+                object_preview_size_limit_mib: 10,
+                language: String::new(),
+                ui_font: font.to_string(),
+                theme_mode: "system".to_string(),
+                dark_theme: "dory_dark".to_string(),
+                light_theme: "dory_light".to_string(),
+                updated_at: String::new(),
+            };
+
+            repo.upsert(&dto).expect("should upsert");
+            let fetched = repo.get().expect("should get").expect("should exist");
+            assert_eq!(
+                fetched.ui_font, font,
+                "ui_font round-trip failed for '{}'",
+                label
+            );
+
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn language_round_trips_through_upsert() {
+        let path = temp_db("language_roundtrip");
+        let conn = open_database(&path).expect("should open");
+        MigrationRegistry::new()
+            .run_all(&conn)
+            .expect("migration should run");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let repo = GeneralSettingsRepository::new(Arc::new(conn));
+
+        let dto = GeneralSettingsDto {
+            id: 1,
+            theme: "dark".to_string(),
+            restore_session_on_startup: 1,
+            reopen_last_connections: 0,
+            default_focus_on_startup: "sidebar".to_string(),
+            max_history_entries: 1000,
+            auto_save_interval_ms: 2000,
+            default_refresh_policy: "manual".to_string(),
+            default_refresh_interval_secs: 5,
+            max_concurrent_background_tasks: 8,
+            auto_refresh_pause_on_error: 1,
+            auto_refresh_only_if_visible: 0,
+            confirm_dangerous_queries: 1,
+            dangerous_requires_where: 1,
+            dangerous_requires_preview: 0,
+            style: "default".to_string(),
+            schema_snapshot_retention: 10,
+            object_preview_size_limit_mib: 10,
+            language: "es".to_string(),
+            ui_font: "Inter".to_string(),
+            theme_mode: "system".to_string(),
+            dark_theme: "dory_dark".to_string(),
+            light_theme: "dory_light".to_string(),
+            updated_at: String::new(),
+        };
+
+        repo.upsert(&dto).expect("should upsert");
+
+        let fetched = repo.get().expect("should get").expect("should exist");
+        assert_eq!(fetched.language, "es");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn style_defaults_to_default_string_when_column_has_default_value() {
+        // Simulate a pre-migration row where 'style' column is absent (DEFAULT kicks in).
+        // After migration 008 runs, existing rows get the column with 'default' value.
+        let path = temp_db("style_column_default");
+        let conn = open_database(&path).expect("should open");
+        MigrationRegistry::new()
+            .run_all(&conn)
+            .expect("migration should run");
+
+        // The singleton row is inserted by the initial migration with id=1.
+        // The style column should have defaulted to 'default'.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let repo = GeneralSettingsRepository::new(Arc::new(conn));
+        let fetched = repo.get().expect("should get").expect("should exist");
+        assert_eq!(
+            fetched.style, "default",
+            "style column default should be 'default'"
+        );
+        assert_eq!(
+            fetched.schema_snapshot_retention, 10,
+            "schema_snapshot_retention column default should be 10"
+        );
+        assert_eq!(
+            fetched.object_preview_size_limit_mib, 10,
+            "object_preview_size_limit_mib column default should be 10"
+        );
+        assert_eq!(fetched.theme_mode, "system");
+        assert_eq!(fetched.dark_theme, "dory_dark");
+        assert_eq!(fetched.light_theme, "dory_light");
+
+        let _ = std::fs::remove_file(&path);
+    }
+}

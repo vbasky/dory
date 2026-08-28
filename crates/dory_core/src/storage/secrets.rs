@@ -1,0 +1,190 @@
+use crate::DbError;
+use secrecy::SecretString;
+
+pub trait SecretStore: Send + Sync {
+    fn is_available(&self) -> bool;
+    fn get(&self, secret_ref: &str) -> Result<Option<SecretString>, DbError>;
+    fn set(&self, secret_ref: &str, value: &SecretString) -> Result<(), DbError>;
+    fn delete(&self, secret_ref: &str) -> Result<(), DbError>;
+}
+
+pub struct NoopSecretStore;
+
+impl SecretStore for NoopSecretStore {
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    fn get(&self, _secret_ref: &str) -> Result<Option<SecretString>, DbError> {
+        Ok(None)
+    }
+
+    fn set(&self, _secret_ref: &str, _value: &SecretString) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    fn delete(&self, _secret_ref: &str) -> Result<(), DbError> {
+        Ok(())
+    }
+}
+
+const SERVICE_NAME: &str = "dory";
+
+fn keyring_get(secret_ref: &str) -> Result<Option<SecretString>, DbError> {
+    let entry = keyring::Entry::new(SERVICE_NAME, secret_ref)
+        .map_err(|e| DbError::IoError(std::io::Error::other(e.to_string())))?;
+
+    match entry.get_password() {
+        Ok(password) => Ok(Some(SecretString::from(password))),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(DbError::IoError(std::io::Error::other(e.to_string()))),
+    }
+}
+
+pub struct KeyringSecretStore {
+    available: bool,
+}
+
+impl KeyringSecretStore {
+    pub fn new() -> Self {
+        let available = Self::check_availability();
+        Self { available }
+    }
+
+    /// Probes the platform secret store and classifies the outcome so a locked
+    /// keyring is not mistaken for a missing one.
+    ///
+    /// - `Ok` / `NoEntry`: backend reachable -> available.
+    /// - `NoStorageAccess`: backend present but locked or access-denied (e.g. a
+    ///   locked login keyring). Reported available so we do NOT downgrade to the
+    ///   no-op store and silently drop secrets; individual writes will surface
+    ///   their own errors until it is unlocked.
+    /// - `PlatformFailure` / other: no working secure storage -> unavailable.
+    ///
+    /// Each case logs a distinct message so a locked keyring can be told apart
+    /// from an absent one when diagnosing.
+    fn check_availability() -> bool {
+        let entry = match keyring::Entry::new(SERVICE_NAME, "__dory_test__") {
+            Ok(entry) => entry,
+            Err(e) => {
+                log::warn!("Keyring backend not constructible; secrets disabled: {e}");
+                return false;
+            }
+        };
+
+        match entry.get_password() {
+            Ok(_) | Err(keyring::Error::NoEntry) => true,
+            Err(keyring::Error::NoStorageAccess(e)) => {
+                log::warn!(
+                    "Keyring present but locked or access-denied; \
+                     secret writes may fail until it is unlocked: {e}"
+                );
+                true
+            }
+            Err(keyring::Error::PlatformFailure(e)) => {
+                log::warn!("Keyring platform unavailable; secrets disabled: {e}");
+                false
+            }
+            Err(e) => {
+                log::warn!("Keyring probe failed; secrets disabled: {e}");
+                false
+            }
+        }
+    }
+}
+
+impl Default for KeyringSecretStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SecretStore for KeyringSecretStore {
+    fn is_available(&self) -> bool {
+        self.available
+    }
+
+    fn get(&self, secret_ref: &str) -> Result<Option<SecretString>, DbError> {
+        if !self.available {
+            return Ok(None);
+        }
+
+        keyring_get(secret_ref)
+    }
+
+    fn set(&self, secret_ref: &str, value: &SecretString) -> Result<(), DbError> {
+        use secrecy::ExposeSecret;
+
+        if !self.available {
+            return Ok(());
+        }
+
+        let entry = keyring::Entry::new(SERVICE_NAME, secret_ref)
+            .map_err(|e| DbError::IoError(std::io::Error::other(e.to_string())))?;
+
+        entry
+            .set_password(value.expose_secret())
+            .map_err(|e| DbError::IoError(std::io::Error::other(e.to_string())))
+    }
+
+    fn delete(&self, secret_ref: &str) -> Result<(), DbError> {
+        if !self.available {
+            return Ok(());
+        }
+
+        let entry = keyring::Entry::new(SERVICE_NAME, secret_ref)
+            .map_err(|e| DbError::IoError(std::io::Error::other(e.to_string())))?;
+
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(DbError::IoError(std::io::Error::other(e.to_string()))),
+        }
+    }
+}
+
+pub fn connection_secret_ref(profile_id: &uuid::Uuid) -> String {
+    format!("dory:conn:{}", profile_id)
+}
+
+pub fn ssh_secret_ref(profile_id: &uuid::Uuid) -> String {
+    format!("dory:ssh:{}", profile_id)
+}
+
+pub fn ssh_tunnel_secret_ref(tunnel_id: &uuid::Uuid) -> String {
+    format!("dory:ssh_tunnel:{}", tunnel_id)
+}
+
+pub fn proxy_secret_ref(proxy_id: &uuid::Uuid) -> String {
+    format!("dory:proxy:{}", proxy_id)
+}
+
+/// Keyring reference for a single secret-kind auth profile field
+/// (`Password` / `WriteOnly`). One entry per (profile, field) so a profile can
+/// hold several independent secrets (e.g. `secret_access_key` + `session_token`).
+pub fn auth_field_secret_ref(profile_id: &uuid::Uuid, field_id: &str) -> String {
+    format!("dory:auth:{}:{}", profile_id, field_id)
+}
+
+pub fn create_secret_store() -> Box<dyn SecretStore> {
+    let keyring_store = KeyringSecretStore::new();
+    if keyring_store.is_available() {
+        Box::new(keyring_store)
+    } else {
+        Box::new(NoopSecretStore)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_secret_ref_format() {
+        let id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(
+            proxy_secret_ref(&id),
+            "dory:proxy:550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+}

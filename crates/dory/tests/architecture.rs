@@ -1,0 +1,197 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+fn collect_rust_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            collect_rust_files(&path, out);
+            continue;
+        }
+
+        if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn read_workspace_file(relative_path: &str) -> String {
+    fs::read_to_string(workspace_root().join(relative_path)).expect("workspace file")
+}
+
+#[test]
+fn ui_does_not_compare_driver_id_directly() {
+    let ui_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+    let mut files = Vec::new();
+    collect_rust_files(&ui_root, &mut files);
+
+    let mut violations = Vec::new();
+
+    for file in files {
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
+        };
+
+        if content.contains("metadata().id ==") {
+            violations.push(file);
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Found direct driver-id comparisons in UI: {:?}",
+        violations
+    );
+}
+
+#[test]
+fn ui_does_not_branch_on_db_kind() {
+    let ui_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+    let mut files = Vec::new();
+    collect_rust_files(&ui_root, &mut files);
+
+    let mut violations = Vec::new();
+
+    for file in files {
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
+        };
+
+        if content.contains("DbKind::") {
+            violations.push(file);
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Found DbKind-specific branching in UI: {:?}",
+        violations
+    );
+}
+
+#[test]
+fn postgres_config_pattern_is_confined_to_core_and_driver() {
+    let workspace = workspace_root();
+    let crates_root = workspace.join("crates");
+    let postgres_pattern = "DbConfig::".to_string() + "Postgres";
+
+    let mut files = Vec::new();
+    collect_rust_files(&crates_root, &mut files);
+
+    let allowed_core = workspace.join("crates/dory_core");
+    let allowed_postgres_driver = workspace.join("crates/dory_driver_postgres");
+    // form.rs may legitimately match against DbConfig::Postgres; it now lives in the
+    // extracted dory_ui_windows crate.
+    let allowed_connection_form =
+        workspace.join("crates/dory_ui_windows/src/connection_manager/form.rs");
+    let allowed_test_support = workspace.join("crates/dory_test_support");
+    // dory_mcp_server and dory_storage may use DbConfig::Postgres directly in tests only
+    let allowed_mcp_server = workspace.join("crates/dory_mcp_server");
+    let allowed_dory_storage = workspace.join("crates/dory_storage");
+
+    let mut violations = Vec::new();
+
+    for file in files {
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
+        };
+
+        if !content.contains(&postgres_pattern) {
+            continue;
+        }
+
+        // Skip this very test file (contains the search pattern as a literal)
+        if file.file_name().is_some_and(|n| n == "architecture.rs") {
+            continue;
+        }
+
+        // Skip test modules - tests may legitimately need to inspect internal config structure
+        if content.contains("#[cfg(test)]") || content.contains("#[test]") {
+            continue;
+        }
+
+        let allowed = file.starts_with(&allowed_core)
+            || file.starts_with(&allowed_postgres_driver)
+            || file.starts_with(&allowed_test_support)
+            || file == allowed_connection_form
+            || file.starts_with(&allowed_mcp_server)
+            || file.starts_with(&allowed_dory_storage);
+
+        if !allowed {
+            violations.push(file);
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Found postgres config variant outside allowed modules: {:?}",
+        violations
+    );
+}
+
+#[test]
+fn external_driver_docs_use_only_canonical_services_key() {
+    let docs = [
+        read_workspace_file("docs/RPC_SERVICES_CONFIG.md"),
+        read_workspace_file("docs/DRIVER_RPC_PROTOCOL.md"),
+        read_workspace_file("examples/custom_driver/README.md"),
+        read_workspace_file("examples/custom_auth_provider/README.md"),
+    ];
+
+    for content in docs {
+        assert!(!content.contains("rpc_services"));
+        assert!(!content.contains("config.json"));
+    }
+}
+
+#[test]
+fn custom_driver_example_json_was_removed() {
+    assert!(
+        !workspace_root()
+            .join("examples/custom_driver/config.example.json")
+            .exists(),
+        "legacy JSON example must not exist"
+    );
+}
+
+#[test]
+fn custom_driver_readme_points_to_settings_backed_rpc_services_flow() {
+    let readme = read_workspace_file("examples/custom_driver/README.md");
+
+    assert!(readme.contains("Settings → RPC Services"));
+    assert!(!readme.contains("config.json"));
+}
+
+#[test]
+fn custom_driver_module_docs_match_manual_and_managed_launch_contract() {
+    let source = read_workspace_file("examples/custom_driver/src/main.rs");
+
+    assert!(source.contains("Settings → RPC Services"));
+    assert!(source.contains("leave both `command` and `args` empty"));
+}
+
+#[test]
+fn custom_auth_provider_docs_point_to_ui_only_flow() {
+    let readme = read_workspace_file("examples/custom_auth_provider/README.md");
+    let source = read_workspace_file("examples/custom_auth_provider/src/main.rs");
+
+    assert!(readme.contains("Settings → RPC Services"));
+    assert!(readme.contains("Settings → Auth Profiles"));
+    assert!(!readme.contains("config.json"));
+
+    assert!(source.contains("Settings → RPC Services"));
+    assert!(source.contains("Settings → Auth Profiles"));
+}

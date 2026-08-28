@@ -1,0 +1,452 @@
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use log::info;
+
+use crate::artifacts::ArtifactStore;
+use crate::error::StorageError;
+use crate::migrations::MigrationRegistry;
+use crate::paths;
+use crate::repositories::app_meta::AppMetaRepository;
+use crate::repositories::audit::AuditRepository;
+use crate::repositories::audit_settings::AuditSettingsRepository;
+use crate::repositories::auth_profiles::AuthProfileRepository;
+use crate::repositories::connection_profiles::ConnectionProfileRepository;
+use crate::repositories::driver_overrides::DriverOverridesRepository;
+use crate::repositories::driver_setting_values::DriverSettingValuesRepository;
+use crate::repositories::driver_settings::DriverSettingsRepository;
+use crate::repositories::general_settings::GeneralSettingsRepository;
+use crate::repositories::governance_settings::GovernanceSettingsRepository;
+use crate::repositories::hook_definitions::HookDefinitionRepository;
+use crate::repositories::proxy_profiles::ProxyProfileRepository;
+use crate::repositories::saved_filters::SavedFiltersRepository;
+use crate::repositories::services::ServiceRepository;
+use crate::repositories::ssh_tunnel_profiles::SshTunnelProfileRepository;
+use crate::repositories::state::{
+    query_history::QueryHistoryRepository, recent_items::RecentItemsRepository,
+    saved_queries::SavedQueriesRepository, sessions::SessionRepository,
+    ui_state::UiStateRepository,
+};
+use crate::repositories::viz_dashboard_panels::DashboardPanelsRepository;
+use crate::repositories::viz_dashboards::DashboardsRepository;
+use crate::repositories::viz_saved_charts::SavedChartsRepository;
+use crate::sqlite;
+
+/// An owned database connection wrapped in Arc for shared access.
+pub type OwnedConnection = Arc<rusqlite::Connection>;
+
+/// Holds the open connection for the unified Dory database.
+///
+/// The single `dory.db` database contains all domains (config, state, audit) using
+/// domain-prefixed table names (`cfg_*`, `st_*`, `aud_*`, `sys_*`).
+///
+/// Obtained exclusively via [`initialize`] — callers never construct this
+/// directly.
+pub struct StorageRuntime {
+    dory_db_path: PathBuf,
+    dory_db: OwnedConnection,
+    /// Manages filesystem artifact paths (scratch/shadow files).
+    /// Content stays on disk; metadata about paths lives in dory.db.
+    artifacts: ArtifactStore,
+}
+
+impl StorageRuntime {
+    /// Creates a runtime pointing at the given unified database path.
+    ///
+    /// The caller is responsible for ensuring the parent directories exist.
+    /// Migrations are applied on first open using the unified schema.
+    #[allow(clippy::result_large_err)]
+    pub fn for_path(dory_db_path: PathBuf) -> Result<Self, StorageError> {
+        // Open and validate dory.db - apply migrations if needed
+        let dory_conn = crate::sqlite::open_database(&dory_db_path)?;
+
+        // Run migrations with foreign-key enforcement disabled so table-rebuild
+        // migrations (drop + recreate to change constraints) do not cascade-delete
+        // child rows when the parent table is dropped. Enforcement is restored for
+        // normal runtime use immediately afterwards.
+        crate::sqlite::set_foreign_keys(&dory_conn, false)?;
+        let registry = MigrationRegistry::new();
+        registry.run_all(&dory_conn)?;
+        crate::sqlite::set_foreign_keys(&dory_conn, true)?;
+
+        // Sidecars created lazily on the first migration write; secure them now.
+        paths::secure_db_sidecars(&dory_db_path)?;
+
+        info!("Unified database ready at {}", dory_db_path.display());
+
+        // Initialize the artifact store using the parent directory of dory.db as data root.
+        // This ensures test/temp runtimes use isolated directories instead of resolving
+        // the real artifact root from the user home directory.
+        let sessions_root = dory_db_path
+            .parent()
+            .map(|p| p.join("sessions"))
+            .unwrap_or_else(|| PathBuf::from("sessions"));
+        let artifacts = ArtifactStore::for_root(sessions_root.clone())?;
+        info!(
+            "Artifact store ready at {}",
+            artifacts.root_path().display()
+        );
+
+        // Wrap connection in Arc for shared access
+        #[allow(clippy::arc_with_non_send_sync)]
+        let dory_db = Arc::new(dory_conn);
+
+        Ok(StorageRuntime {
+            dory_db_path,
+            dory_db,
+            artifacts,
+        })
+    }
+
+    /// Creates a runtime with the database in a temporary directory.
+    ///
+    /// Useful for tests. The directory is created under `std::env::temp_dir()`
+    /// with a unique name to avoid collisions between parallel test runs.
+    #[allow(clippy::result_large_err)]
+    pub fn in_memory() -> Result<Self, StorageError> {
+        let temp_label = format!(
+            "dory_storage_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+
+        let temp_dir = std::env::temp_dir().join(&temp_label);
+        std::fs::create_dir_all(&temp_dir).map_err(|source| StorageError::Io {
+            path: temp_dir.clone(),
+            source,
+        })?;
+
+        let dory_db_path = temp_dir.join("dory.db");
+
+        Self::for_path(dory_db_path)
+    }
+
+    /// Returns the path to the unified database.
+    pub fn dory_db_path(&self) -> &Path {
+        &self.dory_db_path
+    }
+
+    /// Opens a **new** connection to the unified database.
+    ///
+    /// Each call creates a fresh `rusqlite::Connection`; the PRAGMA set is
+    /// re-applied. This keeps `StorageRuntime` cheaply-cloneable (it only
+    /// stores a path) and avoids sharing a single connection across threads.
+    pub fn open_dory_db(&self) -> Result<rusqlite::Connection, StorageError> {
+        sqlite::open_database(&self.dory_db_path)
+    }
+
+    /// Returns an owned reference to the unified database connection.
+    ///
+    /// This is a cloneable reference stored in the Runtime.
+    pub fn dory_db(&self) -> OwnedConnection {
+        self.dory_db.clone()
+    }
+
+    // --- Repository convenience constructors ---
+    //
+    // All repositories now use the single unified database connection.
+    // Config-domain and state-domain tables coexist in the same database
+    // with domain-prefixed names (cfg_*, st_*).
+
+    /// Creates an app metadata repository for one-time migration flags.
+    pub fn app_meta(&self) -> AppMetaRepository {
+        AppMetaRepository::new(self.dory_db())
+    }
+
+    /// Creates a connection profile repository.
+    pub fn connection_profiles(&self) -> ConnectionProfileRepository {
+        ConnectionProfileRepository::new(self.dory_db())
+    }
+
+    /// Creates an auth profile repository.
+    pub fn auth_profiles(&self) -> AuthProfileRepository {
+        AuthProfileRepository::new(self.dory_db())
+    }
+
+    /// Creates a proxy profile repository.
+    pub fn proxy_profiles(&self) -> ProxyProfileRepository {
+        ProxyProfileRepository::new(self.dory_db())
+    }
+
+    /// Creates an SSH tunnel profile repository.
+    pub fn ssh_tunnels(&self) -> SshTunnelProfileRepository {
+        SshTunnelProfileRepository::new(self.dory_db())
+    }
+
+    /// Creates a hook definition repository.
+    pub fn hook_definitions(&self) -> HookDefinitionRepository {
+        HookDefinitionRepository::new(self.dory_db())
+    }
+
+    /// Creates a service repository.
+    pub fn services(&self) -> ServiceRepository {
+        ServiceRepository::new(self.dory_db())
+    }
+
+    /// Creates a driver settings repository.
+    pub fn driver_settings(&self) -> DriverSettingsRepository {
+        DriverSettingsRepository::new(self.dory_db())
+    }
+
+    /// Creates a general settings repository.
+    pub fn general_settings(&self) -> GeneralSettingsRepository {
+        GeneralSettingsRepository::new(self.dory_db())
+    }
+
+    /// Creates a governance settings repository.
+    pub fn governance_settings(&self) -> GovernanceSettingsRepository {
+        GovernanceSettingsRepository::new(self.dory_db())
+    }
+
+    /// Creates a driver overrides repository.
+    pub fn driver_overrides(&self) -> DriverOverridesRepository {
+        DriverOverridesRepository::new(self.dory_db())
+    }
+
+    /// Creates a driver setting values repository.
+    pub fn driver_setting_values(&self) -> DriverSettingValuesRepository {
+        DriverSettingValuesRepository::new(self.dory_db())
+    }
+
+    // --- State repositories ---
+
+    /// Creates a UI state repository.
+    pub fn ui_state(&self) -> UiStateRepository {
+        UiStateRepository::new(self.dory_db())
+    }
+
+    /// Creates a recent items repository.
+    pub fn recent_items(&self) -> RecentItemsRepository {
+        RecentItemsRepository::new(self.dory_db())
+    }
+
+    /// Creates a query history repository.
+    pub fn query_history(&self) -> QueryHistoryRepository {
+        QueryHistoryRepository::new(self.dory_db())
+    }
+
+    /// Creates a saved queries repository.
+    pub fn saved_queries(&self) -> SavedQueriesRepository {
+        SavedQueriesRepository::new(self.dory_db())
+    }
+
+    /// Creates a session repository.
+    pub fn sessions(&self) -> SessionRepository {
+        SessionRepository::new(self.dory_db())
+    }
+
+    /// Creates an audit repository.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened. This can
+    /// happen when the database path is inaccessible (e.g. removed after startup).
+    pub fn audit(&self) -> Result<AuditRepository, StorageError> {
+        use std::sync::Mutex;
+        let conn = self.open_dory_db()?;
+        Ok(AuditRepository::new(Arc::new(Mutex::new(conn))))
+    }
+
+    /// Creates an audit settings repository.
+    pub fn audit_settings(&self) -> AuditSettingsRepository {
+        AuditSettingsRepository::new(self.dory_db())
+    }
+
+    /// Creates a saved filters repository.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened.
+    pub fn saved_filters(&self) -> Result<SavedFiltersRepository, StorageError> {
+        use std::sync::Mutex;
+        let conn = self.open_dory_db()?;
+        Ok(SavedFiltersRepository::new(Arc::new(Mutex::new(conn))))
+    }
+
+    /// Creates a shared `Arc<Mutex<Connection>>` for the viz repositories.
+    ///
+    /// All five viz repos that share this connection will serialize access
+    /// via the same mutex. Callers should create this once and clone the `Arc`
+    /// for each repository that needs it.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened.
+    pub fn viz_connection(
+        &self,
+    ) -> Result<Arc<std::sync::Mutex<rusqlite::Connection>>, StorageError> {
+        let conn = self.open_dory_db()?;
+        Ok(Arc::new(std::sync::Mutex::new(conn)))
+    }
+
+    /// Creates a `SavedChartsRepository` backed by the unified database.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened.
+    pub fn saved_charts(&self) -> Result<SavedChartsRepository, StorageError> {
+        Ok(SavedChartsRepository::new(self.viz_connection()?))
+    }
+
+    /// Creates a `DashboardsRepository` backed by the unified database.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened.
+    pub fn dashboards_repo(&self) -> Result<DashboardsRepository, StorageError> {
+        Ok(DashboardsRepository::new(self.viz_connection()?))
+    }
+
+    /// Creates a `DashboardPanelsRepository` backed by the unified database.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened.
+    pub fn dashboard_panels_repo(&self) -> Result<DashboardPanelsRepository, StorageError> {
+        Ok(DashboardPanelsRepository::new(self.viz_connection()?))
+    }
+
+    /// Creates a `SqlitePendingExecutionStore` backed by the unified database.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened. Callers
+    /// should propagate the error rather than unwrapping, since a failure here
+    /// means the approvals subsystem is unavailable at startup.
+    pub fn pending_executions(
+        &self,
+    ) -> Result<crate::pending_executions::SqlitePendingExecutionStore, StorageError> {
+        let conn = self.open_dory_db()?;
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+        crate::pending_executions::SqlitePendingExecutionStore::new(conn).map_err(|e| {
+            StorageError::Migration {
+                kind: "pending_executions".to_string(),
+                details: e.to_string(),
+            }
+        })
+    }
+
+    /// Returns the artifact store for scratch/shadow path management.
+    pub fn artifacts(&self) -> &ArtifactStore {
+        &self.artifacts
+    }
+
+    /// Returns the scratch file path for a document ID and extension.
+    pub fn scratch_path(&self, doc_id: &str, extension: &str) -> std::path::PathBuf {
+        self.artifacts.scratch_path(doc_id, extension)
+    }
+
+    /// Returns the shadow file path for a document ID.
+    pub fn shadow_path(&self, doc_id: &str) -> std::path::PathBuf {
+        self.artifacts.shadow_path(doc_id)
+    }
+}
+
+/// Bootstraps the internal storage layer.
+///
+/// This must be called once during application startup.  If it returns `Err`,
+/// the application should abort — internal storage is mandatory.
+///
+/// What it does:
+/// 1. Resolves `~/.local/share/dory/` (creating if needed).
+/// 2. Opens (or creates) `dory.db` in the data directory with unified migrations applied.
+/// 3. Returns a [`StorageRuntime`] that can hand out connections on demand.
+#[allow(clippy::result_large_err)]
+pub fn initialize() -> Result<StorageRuntime, StorageError> {
+    let dory_db_path = paths::dory_db_path()?;
+
+    info!("Unified database path: {}", dory_db_path.display());
+
+    StorageRuntime::for_path(dory_db_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sqlite;
+    use std::path::Path;
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dory_storage_{}_{}_{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn initialize_succeeds_with_default_paths() {
+        // Use in-memory storage for tests to avoid polluting ~/.local/share/dory
+        let runtime = StorageRuntime::in_memory().expect("bootstrap should succeed");
+        assert!(runtime.dory_db_path().exists());
+    }
+
+    #[test]
+    fn storage_runtime_opens_unified_db() {
+        // Use in-memory storage for tests to avoid polluting ~/.local/share/dory
+        let runtime = StorageRuntime::in_memory().expect("bootstrap should succeed");
+        let conn = runtime.open_dory_db().expect("should open dory db");
+
+        // MigrationRegistry has run, so sys_migrations should have the initial migration
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sys_migrations WHERE name = '001_initial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "001_initial migration should be recorded");
+    }
+
+    #[test]
+    fn temp_dir_bootstrap_creates_directories_and_database() {
+        let dir = unique_temp_dir("bootstrap");
+        assert!(!dir.exists());
+
+        std::fs::create_dir_all(&dir).expect("should create temp dir");
+        let db_path = dir.join("test.sqlite");
+
+        let conn = sqlite::open_database(&db_path).expect("should open");
+        assert!(db_path.exists());
+
+        // Verify PRAGMAs applied.
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nested_directory_creation_succeeds() {
+        let base = unique_temp_dir("nested");
+        let dir = base.join("a").join("b").join("c");
+
+        std::fs::create_dir_all(&dir).expect("nested dirs should be created");
+        let db_path = dir.join("nested.sqlite");
+
+        let conn = sqlite::open_database(&db_path).expect("should open in nested dir");
+        assert!(db_path.exists());
+
+        let _: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn open_database_fails_on_readonly_path() {
+        let bad_path = Path::new("/proc/nonexistent_subdir/test.sqlite");
+        let result = sqlite::open_database(bad_path);
+        assert!(result.is_err(), "should fail on unwritable path");
+    }
+
+    #[test]
+    fn open_database_fails_on_directory_instead_of_file() {
+        let dir = unique_temp_dir("isdir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = sqlite::open_database(&dir);
+        assert!(result.is_err(), "should fail when path is a directory");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

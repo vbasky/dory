@@ -1,0 +1,26 @@
+[package]
+name = "dory_driver_dynamodb"
+version.workspace = true
+edition.workspace = true
+publish = false
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+dory_core.workspace = true
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-dynamodb = "1"
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+dory_test_support.workspace = true
+
+[lints]
+workspace = true

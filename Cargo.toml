@@ -1,0 +1,192 @@
+[workspace]
+members = [
+    "crates/dory",
+    "crates/dory_app",
+    "crates/dory_ui",
+    "crates/dory_ui_base",
+    "crates/dory_ui_document",
+    "crates/dory_ui_windows",
+    "crates/dory_ui_sidebar",
+    "crates/dory_components",
+    "crates/dory_core",
+    "crates/dory_lua",
+    "crates/dory_ipc",
+    "crates/dory_driver_ipc",
+    "crates/dory_test_support",
+    "crates/dory_driver_sqlite",
+    "crates/dory_driver_postgres",
+    "crates/dory_driver_mysql",
+    "crates/dory_driver_mongodb",
+    "crates/dory_driver_redis",
+    "crates/dory_driver_dynamodb",
+    "crates/dory_driver_cloudwatch",
+    "crates/dory_driver_mssql",
+    "crates/dory_driver_redshift",
+    "crates/dory_driver_clickhouse",
+    "crates/dory_ssh",
+    "crates/dory_proxy",
+    "crates/dory_tunnel_core",
+    "crates/dory_export",
+    "crates/dory_transfer",
+    "crates/dory_driver_host",
+    "crates/dory_aws",
+    "crates/dory_ssm",
+    "crates/dory_mcp",
+    "crates/dory_mcp_server",
+    "crates/dory_policy",
+    "crates/dory_approval",
+    "crates/dory_audit",
+    "crates/dory_storage",
+    "crates/dory_driver_influxdb",
+    "crates/dory_portability",
+    "crates/dory_driver_s3",
+    "crates/dory_i18n",
+]
+default-members = ["crates/dory"]
+# The website is not a crate. Excluding it keeps cargo from descending into it
+# when resolving paths or packaging.
+exclude = ["web"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+version = "0.8.0-dev.0"
+authors = ["Dory contributors"]
+description = "A fast, keyboard-first database client"
+repository = "https://github.com/vbasky/dory"
+homepage = "https://dory.dev"
+documentation = "https://docs.dory.dev/"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+dory = { path = "crates/dory" }
+dory_core = { path = "crates/dory_core" }
+dory_lua = { path = "crates/dory_lua" }
+dory_test_support = { path = "crates/dory_test_support" }
+dory_driver_sqlite = { path = "crates/dory_driver_sqlite" }
+dory_driver_postgres = { path = "crates/dory_driver_postgres" }
+dory_driver_mysql = { path = "crates/dory_driver_mysql" }
+dory_driver_mongodb = { path = "crates/dory_driver_mongodb" }
+dory_driver_redis = { path = "crates/dory_driver_redis" }
+dory_driver_dynamodb = { path = "crates/dory_driver_dynamodb" }
+dory_driver_cloudwatch = { path = "crates/dory_driver_cloudwatch" }
+dory_driver_mssql = { path = "crates/dory_driver_mssql" }
+dory_driver_redshift = { path = "crates/dory_driver_redshift" }
+dory_driver_clickhouse = { path = "crates/dory_driver_clickhouse" }
+dory_ssh = { path = "crates/dory_ssh" }
+dory_proxy = { path = "crates/dory_proxy" }
+dory_export = { path = "crates/dory_export" }
+dory_ipc = { path = "crates/dory_ipc" }
+dory_driver_ipc = { path = "crates/dory_driver_ipc" }
+dory_aws = { path = "crates/dory_aws" }
+dory_ssm = { path = "crates/dory_ssm" }
+dory_mcp = { path = "crates/dory_mcp" }
+dory_mcp_server = { path = "crates/dory_mcp_server" }
+dory_policy = { path = "crates/dory_policy" }
+dory_approval = { path = "crates/dory_approval" }
+dory_audit = { path = "crates/dory_audit" }
+dory_storage = { path = "crates/dory_storage" }
+dory_driver_influxdb = { path = "crates/dory_driver_influxdb" }
+dory_portability = { path = "crates/dory_portability" }
+dory_driver_s3 = { path = "crates/dory_driver_s3" }
+dory_app = { path = "crates/dory_app" }
+dory_components = { path = "crates/dory_components" }
+dory_ui_base = { path = "crates/dory_ui_base" }
+dory_ui_document = { path = "crates/dory_ui_document" }
+dory_ui_windows = { path = "crates/dory_ui_windows" }
+dory_ui_sidebar = { path = "crates/dory_ui_sidebar" }
+dory_ui = { path = "crates/dory_ui" }
+dory_transfer = { path = "crates/dory_transfer" }
+dory_i18n = { path = "crates/dory_i18n" }
+mysql = "28"
+
+gpui = "0.2.2"
+gpui-component = { version = "0.5.0", features = ["tree-sitter-languages"] }
+core-text = ">=21.0.0, <21.1.0"
+smallvec = "1.13.2"
+rfd = "0.17"
+# Raster decoding for object previews. Already in the tree via gpui (which
+# decodes `img()` sources with the same crate); the direct dependency only
+# exists so previews can validate bytes and read pixel dimensions before
+# handing them to the renderer.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "gif",
+    "bmp",
+] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+anyhow = "1"
+postcard = { version = "1", features = ["use-std"] }
+lsp-types = "0.97"
+toml = "1"
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+thiserror = "2"
+secrecy = "0.10"
+age = { version = "0.11", features = ["armor"] }
+dirs = "6"
+rusqlite = { version = "0.40", features = ["bundled"] }
+tokio-postgres = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+log = "0.4"
+env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-log = "0.2"
+tracing-appender = "0.2"
+fuzzy-matcher = "0.3"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "gzip", "json"] }
+csv = "1"
+chrono = { version = "0.4", features = ["serde"] }
+urlencoding = "2"
+base64 = "0.22"
+hex = "0.4"
+sha2 = "0.11"
+interprocess = "2.4"
+mlua = "0.11"
+indexmap = "2"
+rust-i18n = "3.1"
+sys-locale = "0.3"
+serde_yaml = "0.9"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unused_must_use = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unwrap_in_result = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+indexing_slicing = "warn"
+
+# Development build profile tuned for memory and link speed.
+# Full debug info (debug = 2) is the main driver of peak RAM and disk usage
+# when linking this many crates; line tables keep backtraces usable at a
+# fraction of the cost.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies rarely need debugging; dropping their debug info entirely is a
+# large reduction in target/ size and link-time memory.
+[profile.dev.package."*"]
+debug = false
+
+# Release build profile tuned for binary size and runtime speed.
+# `panic` is intentionally left at the default `unwind`: switching to `abort` is a
+# separate decision that loses `catch_unwind` and may break GPUI internals that
+# rely on unwinding, so it is not changed here.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,38 @@
+[package]
+name = "dory_aws"
+version.workspace = true
+publish = false
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+dory_core = { path = "../dory_core" }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-sso = "1"
+aws-sdk-sts = "1"
+aws-sdk-secretsmanager = "1"
+aws-sdk-ssm = "1"
+async-trait = { workspace = true }
+log = "0.4"
+secrecy = "0.10"
+tokio = { workspace = true, features = ["rt", "net", "time", "process", "fs"] }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+sha1 = "0.11"
+sha2 = "0.11"
+hex = { workspace = true }
+futures-lite = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile = "3"
+filetime = "0.2"

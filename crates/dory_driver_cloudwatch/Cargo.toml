@@ -1,0 +1,25 @@
+[package]
+name = "dory_driver_cloudwatch"
+version.workspace = true
+edition.workspace = true
+publish = false
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+dory_core.workspace = true
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-cloudwatchlogs = "1"
+aws-sdk-cloudwatch = "1"
+tokio = { workspace = true, features = ["time"] }
+serde_json = { workspace = true }
+log = "0.4"

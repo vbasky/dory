@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Dory">
+  <rect x="0" y="0" width="128" height="128" rx="28" ry="28" fill="#0C6798"/>
+  <!-- Fish body -->
+  <path fill="#155A80" d="
+    M56 44
+    Q56 40 60 40
+    H71
+    C91 40 95 50 95 64
+    C95 78 91 88 71 88
+    H60
+    Q56 88 56 84
+    Z"/>
+  <!-- Geometric D -->
+  <path fill="#FFFFFF" fill-rule="evenodd" d="
+    M38 32
+    Q38 28 42 28
+    H70
+    C104 28 109 44 109 64
+    C109 84 104 100 70 100
+    H42
+    Q38 100 38 96
+    Z
+    M56 44
+    Q56 40 60 40
+    H71
+    C91 40 95 50 95 64
+    C95 78 91 88 71 88
+    H60
+    Q56 88 56 84
+    Z"/>
+  <!-- Two-lobe tail, thicker for small sizes -->
+  <path fill="#FFFFFF" stroke="#FFFFFF" stroke-width="2" stroke-linejoin="round" d="
+    M38 54
+    L16 42
+    L26 64
+    L16 86
+    L38 74
+    Z"/>
+  <!-- Eye, slightly larger so it survives 16px -->
+  <circle cx="86" cy="60" r="5.5" fill="#F0C014"/>
+</svg>

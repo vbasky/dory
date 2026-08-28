@@ -1,0 +1,1052 @@
+//! Dynamic migration system for Dory SQLite consolidation.
+//!
+//! This module provides a trait-based, dynamically-discovered migration system where each
+//! migration is a separate file implementing the [`Migration`] trait. The [`MigrationRegistry`]
+//! holds all migrations and runs them sequentially, tracking executed migrations in the
+//! `sys_migrations` table.
+//!
+//! ## Architecture
+//!
+//! - **One file per migration** — e.g., `001_initial.rs`, `002_add_foo.rs`
+//! - **Trait-based** — each migration implements [`Migration`] with `name()` and `run()`
+//! - **Dynamic discovery** — registry collects all migrations and runs pending ones
+//! - **Sequential execution** — migrations run in order, tracked in `sys_migrations`
+//!
+//! ## Domain Prefix Convention
+//!
+//! - `app_*` — Application runtime domain (pending approvals, transient runtime state)
+//! - `cfg_*` — Config domain (profiles, auth, hooks, services, governance)
+//! - `st_*`  — State domain (sessions, query history, UI state)
+//! - `aud_*` — Audit domain (audit events)
+//! - `sys_*` — System domain (migrations, metadata)
+//! - `sch_*` — Schema domain (persisted schema snapshots)
+//!
+//! ## Usage
+//!
+//! ```ignore
+//! let registry = MigrationRegistry::new();
+//! registry.register(mod_001_initial::MigrationImpl);
+//! registry.run_all(&conn)?;
+//! ```
+
+use log::info;
+use rusqlite::{Connection, Transaction};
+
+use crate::error::StorageError;
+
+// ---------------------------------------------------------------------------
+// Migration trait and error types
+// ---------------------------------------------------------------------------
+
+/// Error type for migration-specific failures.
+#[derive(Debug)]
+pub enum MigrationError {
+    /// The database returned an error during migration.
+    Sqlite {
+        path: std::path::PathBuf,
+        source: rusqlite::Error,
+    },
+    /// A migration failed to apply.
+    Failed { name: String, details: String },
+}
+
+impl std::fmt::Display for MigrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MigrationError::Sqlite { path, source } => {
+                write!(
+                    f,
+                    "migration sqlite error for {}: {}",
+                    path.display(),
+                    source
+                )
+            }
+            MigrationError::Failed { name, details } => {
+                write!(f, "migration '{}' failed: {}", name, details)
+            }
+        }
+    }
+}
+
+impl std::error::Error for MigrationError {}
+
+impl From<MigrationError> for StorageError {
+    fn from(err: MigrationError) -> Self {
+        match err {
+            MigrationError::Sqlite { path, source } => StorageError::Sqlite { path, source },
+            MigrationError::Failed { name, details } => StorageError::Migration {
+                kind: name,
+                details,
+            },
+        }
+    }
+}
+
+impl From<rusqlite::Error> for MigrationError {
+    fn from(source: rusqlite::Error) -> Self {
+        MigrationError::Sqlite {
+            path: std::path::PathBuf::from("<unknown>"),
+            source,
+        }
+    }
+}
+
+/// Trait implemented by each database migration.
+///
+/// Each migration is a self-contained file that:
+/// - Has a unique name returned by `name()`
+/// - Contains all DDL in `run()` that creates/modifies schema
+///
+/// Migrations are idempotent by nature (CREATE TABLE IF NOT EXISTS etc.).
+pub trait Migration: Send {
+    /// Returns the unique name of this migration.
+    ///
+    /// Must match the filename prefix (e.g., `001_initial` for `001_initial.rs`).
+    fn name(&self) -> &str;
+
+    /// Runs this migration against the given transaction.
+    ///
+    /// Implementations should use `CREATE TABLE IF NOT EXISTS` etc. to ensure
+    /// idempotency. The transaction will be rolled back on error.
+    fn run(&self, tx: &Transaction) -> Result<(), MigrationError>;
+}
+
+// ---------------------------------------------------------------------------
+// MigrationRegistry
+// ---------------------------------------------------------------------------
+
+/// A registry that holds all migrations and can run them sequentially.
+///
+/// # Example
+///
+/// ```ignore
+/// let registry = MigrationRegistry::new();
+/// registry.run_all(&conn)?;
+/// ```
+pub struct MigrationRegistry {
+    migrations: Vec<Box<dyn Migration>>,
+}
+
+impl MigrationRegistry {
+    /// Creates a new registry with all registered migrations.
+    pub fn new() -> Self {
+        let mut registry = Self {
+            migrations: Vec::new(),
+        };
+        registry.register(mod_001_initial::MigrationImpl);
+        registry.register(mod_002_audit_extended::MigrationImpl);
+        registry.register(mod_003_audit_settings::MigrationImpl);
+        registry.register(mod_004_audit_saved_filters::MigrationImpl);
+        registry.register(mod_005_rpc_service_kind::MigrationImpl);
+        registry.register(mod_006_rpc_service_api_contract::MigrationImpl);
+        registry.register(mod_007_session_exec_ctx_json::MigrationImpl);
+        registry.register(mod_008_general_settings_style::MigrationImpl);
+        registry.register(mod_009_mssql_instance::MigrationImpl);
+        // The 010/011/014 file prefixes below were historically duplicated across two
+        // parallel migration series merged from separate branches. The file-prefix
+        // collision has been resolved by renaming the visualization-domain files to
+        // the `b`-suffix variants (mod_010b_*, mod_011b_*, mod_014b_*). The `name()`
+        // strings inside those files are frozen: `sys_migrations` keys rows by
+        // `name()`, so renaming a `name()` string would re-run that migration on every
+        // existing user database. Never change the `name()` return values.
+        registry.register(mod_010_aws_reflect_migration_flag::MigrationImpl);
+        registry.register(mod_011_connection_drop_auth_profile_fk::MigrationImpl);
+        registry.register(mod_010b_viz_charts_and_dashboards::MigrationImpl);
+        registry.register(mod_011b_viz_saved_chart_metric_source::MigrationImpl);
+        registry.register(mod_012_viz_saved_chart_metric_series::MigrationImpl);
+        registry.register(mod_013_viz_dashboard_panel_kind::MigrationImpl);
+        registry.register(mod_014_audit_settings_log_capture_min_level::MigrationImpl);
+        registry.register(mod_014b_viz_inspector_and_instance_metric::MigrationImpl);
+        registry.register(mod_015_viz_inspector_saved_chart_id_constraint::MigrationImpl);
+        registry.register(mod_016_viz_divider_saved_chart_id_constraint::MigrationImpl);
+        registry.register(mod_017_qry_saved_queries::MigrationImpl);
+        registry.register(mod_018_app_pending_executions::MigrationImpl);
+        registry.register(mod_019_hook_env_denylist::MigrationImpl);
+        registry.register(mod_020_sch_schema_snapshots::MigrationImpl);
+        registry.register(mod_021_general_settings_schema_snapshot_retention::MigrationImpl);
+        registry.register(mod_022_hook_kind_json::MigrationImpl);
+        registry.register(mod_023_profile_hook_interpreter::MigrationImpl);
+        registry.register(mod_024_s3_config_columns::MigrationImpl);
+        registry.register(mod_025_general_settings_object_preview_limit::MigrationImpl);
+        registry.register(mod_026_general_settings_language::MigrationImpl);
+        registry.register(mod_027_general_settings_ui_font::MigrationImpl);
+        registry.register(mod_028_general_settings_theme_mode::MigrationImpl);
+        registry
+    }
+
+    /// Registers a migration with the registry.
+    ///
+    /// Migrations are executed in the order they are registered.
+    pub fn register<M: Migration + 'static>(&mut self, migration: M) {
+        self.migrations.push(Box::new(migration));
+    }
+
+    /// Runs all pending migrations that have not yet been applied.
+    ///
+    /// Checks the `sys_migrations` table to determine which migrations have
+    /// already been applied and skips them. Runs remaining migrations in
+    /// registration order.
+    ///
+    /// The `sys_migrations` DDL and the first pending migration's body are committed
+    /// as one atomic unit so there is no window in which the table exists but the
+    /// first migration's record does not. Migrations 2..N each run in their own
+    /// transaction, unchanged from the original behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError`] if:
+    /// - A database error occurs while checking applied migrations
+    /// - A migration's `run()` method returns an error
+    pub fn run_all(&self, conn: &Connection) -> Result<(), MigrationError> {
+        let mut remaining_migrations = {
+            let outer_tx =
+                conn.unchecked_transaction()
+                    .map_err(|source| MigrationError::Sqlite {
+                        path: conn_path(conn),
+                        source,
+                    })?;
+
+            self.ensure_sys_migrations(&outer_tx)?;
+
+            let applied = self.get_applied_migrations(&outer_tx).map_err(|source| {
+                MigrationError::Sqlite {
+                    path: conn_path(conn),
+                    source,
+                }
+            })?;
+
+            info!(
+                "MigrationRegistry: {} migrations already applied, checking {} registered",
+                applied.len(),
+                self.migrations.len()
+            );
+
+            let mut pending: Vec<&dyn Migration> = self
+                .migrations
+                .iter()
+                .filter(|m| !applied.contains(m.name()))
+                .map(|m| m.as_ref())
+                .collect();
+
+            if let Some(first) = pending.first() {
+                let name = first.name();
+                info!("MigrationRegistry: applying migration '{}'", name);
+
+                first.run(&outer_tx)?;
+
+                outer_tx
+                    .execute(
+                        "INSERT INTO sys_migrations (name, applied_at) VALUES (?1, datetime('now'))",
+                        rusqlite::params![name],
+                    )
+                    .map_err(|source| MigrationError::Sqlite {
+                        path: conn_path(conn),
+                        source,
+                    })?;
+
+                outer_tx.commit().map_err(|source| MigrationError::Sqlite {
+                    path: conn_path(conn),
+                    source,
+                })?;
+
+                info!("MigrationRegistry: '{}' applied successfully", name);
+                pending.remove(0);
+            } else {
+                outer_tx.commit().map_err(|source| MigrationError::Sqlite {
+                    path: conn_path(conn),
+                    source,
+                })?;
+            }
+
+            pending
+        };
+
+        for migration in remaining_migrations.drain(..) {
+            let name = migration.name();
+
+            info!("MigrationRegistry: applying migration '{}'", name);
+
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|source| MigrationError::Sqlite {
+                    path: conn_path(conn),
+                    source,
+                })?;
+
+            migration.run(&tx)?;
+
+            tx.execute(
+                "INSERT INTO sys_migrations (name, applied_at) VALUES (?1, datetime('now'))",
+                rusqlite::params![name],
+            )
+            .map_err(|source| MigrationError::Sqlite {
+                path: conn_path(conn),
+                source,
+            })?;
+
+            tx.commit().map_err(|source| MigrationError::Sqlite {
+                path: conn_path(conn),
+                source,
+            })?;
+
+            info!("MigrationRegistry: '{}' applied successfully", name);
+        }
+
+        Ok(())
+    }
+
+    /// Returns a list of migrations that have not yet been applied.
+    pub fn get_pending(&self, conn: &Connection) -> Result<Vec<&dyn Migration>, MigrationError> {
+        self.ensure_sys_migrations(conn)?;
+
+        let applied: std::collections::HashSet<String> = self
+            .get_applied_migrations(conn)
+            .map_err(|source| MigrationError::Sqlite {
+                path: conn_path(conn),
+                source,
+            })?;
+
+        Ok(self
+            .migrations
+            .iter()
+            .filter(|m| !applied.contains(m.name()))
+            .map(|m| m.as_ref())
+            .collect())
+    }
+
+    /// Ensures the sys_migrations table exists.
+    fn ensure_sys_migrations(&self, conn: &Connection) -> Result<(), MigrationError> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sys_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+            [],
+        )
+        .map_err(|source| MigrationError::Sqlite {
+            path: conn_path(conn),
+            source,
+        })?;
+
+        Ok(())
+    }
+
+    /// Returns the set of migration names that have already been applied.
+    fn get_applied_migrations(
+        &self,
+        conn: &Connection,
+    ) -> Result<std::collections::HashSet<String>, rusqlite::Error> {
+        let mut stmt = conn.prepare("SELECT name FROM sys_migrations")?;
+        let names: std::collections::HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        Ok(names)
+    }
+}
+
+impl Default for MigrationRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub mod aud_schema;
+mod mod_001_initial;
+mod mod_002_audit_extended;
+mod mod_003_audit_settings;
+mod mod_004_audit_saved_filters;
+mod mod_005_rpc_service_kind;
+mod mod_006_rpc_service_api_contract;
+mod mod_007_session_exec_ctx_json;
+mod mod_008_general_settings_style;
+mod mod_009_mssql_instance;
+mod mod_010_aws_reflect_migration_flag;
+mod mod_010b_viz_charts_and_dashboards;
+mod mod_011_connection_drop_auth_profile_fk;
+mod mod_011b_viz_saved_chart_metric_source;
+mod mod_012_viz_saved_chart_metric_series;
+mod mod_013_viz_dashboard_panel_kind;
+mod mod_014_audit_settings_log_capture_min_level;
+mod mod_014b_viz_inspector_and_instance_metric;
+mod mod_015_viz_inspector_saved_chart_id_constraint;
+mod mod_016_viz_divider_saved_chart_id_constraint;
+mod mod_017_qry_saved_queries;
+mod mod_018_app_pending_executions;
+mod mod_019_hook_env_denylist;
+mod mod_020_sch_schema_snapshots;
+mod mod_021_general_settings_schema_snapshot_retention;
+mod mod_022_hook_kind_json;
+mod mod_023_profile_hook_interpreter;
+mod mod_024_s3_config_columns;
+mod mod_025_general_settings_object_preview_limit;
+mod mod_026_general_settings_language;
+mod mod_027_general_settings_ui_font;
+mod mod_028_general_settings_theme_mode;
+
+pub use mod_001_initial::MigrationImpl;
+pub use mod_002_audit_extended::MigrationImpl as MigrationImplAuditExtended;
+pub use mod_003_audit_settings::MigrationImpl as MigrationImplAuditSettings;
+pub use mod_004_audit_saved_filters::MigrationImpl as MigrationImplAuditSavedFilters;
+pub use mod_005_rpc_service_kind::MigrationImpl as MigrationImplRpcServiceKind;
+pub use mod_006_rpc_service_api_contract::MigrationImpl as MigrationImplRpcServiceApiContract;
+pub use mod_007_session_exec_ctx_json::MigrationImpl as MigrationImplSessionExecCtxJson;
+pub use mod_008_general_settings_style::MigrationImpl as MigrationImplGeneralSettingsStyle;
+pub use mod_010_aws_reflect_migration_flag::MigrationImpl as MigrationImplAwsReflectMigrationFlag;
+
+// ---------------------------------------------------------------------------
+// Database verification utilities
+// ---------------------------------------------------------------------------
+
+/// Verifies database integrity using `PRAGMA integrity_check`.
+pub fn verify_integrity(conn: &Connection) -> Result<bool, StorageError> {
+    let result: String = conn
+        .pragma_query_value(None, "integrity_check", |row| row.get(0))
+        .map_err(|source| StorageError::Sqlite {
+            path: conn_path(conn),
+            source,
+        })?;
+    Ok(result == "ok")
+}
+
+fn conn_path(conn: &Connection) -> std::path::PathBuf {
+    conn.path()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("<unknown>"))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn column_names(conn: &Connection, table: &str) -> std::collections::HashSet<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "dory_migration_{}_{}_{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    /// Helper to get all table names from sqlite_master.
+    fn table_names(conn: &Connection) -> std::collections::HashSet<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    #[test]
+    fn test_run_all_idempotent() {
+        let temp_dir = temp_dir("idempotent");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let registry = MigrationRegistry::new();
+
+        registry.run_all(&conn).unwrap();
+
+        let count_first: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sys_migrations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count_first,
+            registry.migrations.len() as i64,
+            "expected all registered migrations after first run"
+        );
+
+        registry.run_all(&conn).unwrap();
+
+        let count_second: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sys_migrations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count_second,
+            registry.migrations.len() as i64,
+            "expected same migration count after second run (idempotent)"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_run_all_creates_all_tables() {
+        let temp_dir = temp_dir("tables");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let registry = MigrationRegistry::new();
+        registry.run_all(&conn).unwrap();
+
+        let tables = table_names(&conn);
+
+        // Config domain tables
+        assert!(
+            tables.contains("cfg_auth_profiles"),
+            "missing cfg_auth_profiles"
+        );
+        assert!(
+            tables.contains("cfg_connection_profiles"),
+            "missing cfg_connection_profiles"
+        );
+        assert!(
+            tables.contains("cfg_proxy_profiles"),
+            "missing cfg_proxy_profiles"
+        );
+        assert!(
+            tables.contains("cfg_ssh_tunnel_profiles"),
+            "missing cfg_ssh_tunnel_profiles"
+        );
+        assert!(
+            tables.contains("cfg_hook_definitions"),
+            "missing cfg_hook_definitions"
+        );
+        assert!(tables.contains("cfg_services"), "missing cfg_services");
+        assert!(
+            tables.contains("cfg_governance_settings"),
+            "missing cfg_governance_settings"
+        );
+        assert!(
+            tables.contains("cfg_trusted_clients"),
+            "missing cfg_trusted_clients"
+        );
+        assert!(
+            tables.contains("cfg_policy_roles"),
+            "missing cfg_policy_roles"
+        );
+        assert!(
+            tables.contains("cfg_tool_policies"),
+            "missing cfg_tool_policies"
+        );
+        assert!(
+            tables.contains("cfg_connection_folders"),
+            "missing cfg_connection_folders"
+        );
+        assert!(
+            tables.contains("cfg_driver_overrides"),
+            "missing cfg_driver_overrides"
+        );
+
+        // State domain tables
+        assert!(tables.contains("st_sessions"), "missing st_sessions");
+        assert!(
+            tables.contains("st_session_tabs"),
+            "missing st_session_tabs"
+        );
+        assert!(
+            tables.contains("st_query_history"),
+            "missing st_query_history"
+        );
+        assert!(
+            tables.contains("st_saved_queries"),
+            "missing st_saved_queries"
+        );
+        assert!(tables.contains("st_ui_state"), "missing st_ui_state");
+        assert!(
+            tables.contains("st_recent_items"),
+            "missing st_recent_items"
+        );
+        assert!(
+            tables.contains("st_schema_cache"),
+            "missing st_schema_cache"
+        );
+        assert!(tables.contains("st_event_log"), "missing st_event_log");
+
+        // Audit domain tables
+        assert!(
+            tables.contains("aud_audit_events"),
+            "missing aud_audit_events"
+        );
+        assert!(
+            tables.contains("aud_audit_event_entities"),
+            "missing aud_audit_event_entities"
+        );
+        assert!(
+            tables.contains("aud_audit_event_attributes"),
+            "missing aud_audit_event_attributes"
+        );
+
+        // System domain tables
+        assert!(tables.contains("sys_migrations"), "missing sys_migrations");
+        assert!(tables.contains("sys_app_meta"), "missing sys_app_meta");
+
+        // Migration 010: dangling_origin column on cfg_auth_profiles
+        let hook_columns = column_names(&conn, "cfg_hook_definitions");
+        assert!(
+            hook_columns.contains("kind_json"),
+            "cfg_hook_definitions missing kind_json column"
+        );
+
+        let auth_columns = column_names(&conn, "cfg_auth_profiles");
+        assert!(
+            auth_columns.contains("dangling_origin"),
+            "cfg_auth_profiles missing dangling_origin column"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_get_pending_returns_unapplied() {
+        let temp_dir = temp_dir("pending");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let registry = MigrationRegistry::new();
+
+        let pending_before = registry.get_pending(&conn).unwrap();
+        assert_eq!(
+            pending_before.len(),
+            registry.migrations.len(),
+            "expected all registered migrations pending before running"
+        );
+        assert_eq!(pending_before[0].name(), "001_initial");
+        assert_eq!(pending_before[1].name(), "002_audit_extended");
+        assert_eq!(pending_before[2].name(), "003_audit_settings");
+        assert_eq!(pending_before[3].name(), "004_audit_saved_filters");
+        assert_eq!(pending_before[4].name(), "005_rpc_service_kind");
+        assert_eq!(pending_before[5].name(), "006_rpc_service_api_contract");
+        assert_eq!(pending_before[6].name(), "007_session_exec_ctx_json");
+
+        registry.run_all(&conn).unwrap();
+
+        let pending_after = registry.get_pending(&conn).unwrap();
+        assert!(
+            pending_after.is_empty(),
+            "expected no pending migrations after running"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_verification_passes() {
+        let temp_dir = std::env::temp_dir().join("dory_migration_verify");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let registry = MigrationRegistry::new();
+        registry.run_all(&conn).unwrap();
+
+        // Verify PRAGMA integrity_check passes
+        let integrity_result: String = conn
+            .pragma_query_value(None, "integrity_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_result, "ok",
+            "integrity_check did not return 'ok'"
+        );
+
+        // Verify PRAGMA foreign_key_check passes
+        // foreign_key_check returns an empty result set when there are no violations
+        // (it returns rows only when FK violations exist), so QueryReturnedNoRows = success
+        let fk_check_result: Result<String, _> =
+            conn.pragma_query_value(None, "foreign_key_check", |row| row.get(0));
+        assert!(
+            fk_check_result.is_err(),
+            "foreign_key_check should return no rows (no violations)"
+        );
+        // The error being Err(QueryReturnedNoRows) means success - no FK violations
+        if let Err(rusqlite::Error::QueryReturnedNoRows) = fk_check_result {
+            // Expected: no FK violations
+        } else {
+            panic!(
+                "foreign_key_check returned unexpected error: {:?}",
+                fk_check_result
+            );
+        }
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_run_all_adds_service_kind_column_to_cfg_services() {
+        let temp_dir = temp_dir("service_kind_column");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        MigrationRegistry::new().run_all(&conn).unwrap();
+
+        let columns = column_names(&conn, "cfg_services");
+        assert!(columns.contains("service_kind"));
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_pending_service_kind_migration_upgrades_legacy_rows_to_driver() {
+        let temp_dir = temp_dir("service_kind_legacy");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE sys_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))",
+            [],
+        )
+        .unwrap();
+        for migration in [
+            "001_initial",
+            "002_audit_extended",
+            "003_audit_settings",
+            "004_audit_saved_filters",
+        ] {
+            conn.execute("INSERT INTO sys_migrations (name) VALUES (?1)", [migration])
+                .unwrap();
+        }
+
+        conn.execute_batch(
+            r#"
+            CREATE TABLE cfg_services (
+                socket_id TEXT PRIMARY KEY,
+                enabled INTEGER DEFAULT 1,
+                command TEXT,
+                startup_timeout_ms INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO cfg_services (socket_id, enabled, command, startup_timeout_ms)
+            VALUES ('legacy-socket', 1, 'dory-driver-host', 5000);
+
+            -- Pre-create the cfg_connection_profiles stub that migrations
+            -- registered after 001_initial expect to exist. The test
+            -- pretends 001_initial already ran without actually creating its
+            -- tables, so subsequent migrations (mod_010+ in particular) that
+            -- reference cfg_connection_profiles via FK fail when SQLite tries
+            -- to resolve those references during table rebuilds.
+            CREATE TABLE IF NOT EXISTS cfg_connection_profiles (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                driver_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            "#,
+        )
+        .unwrap();
+
+        MigrationRegistry::new().run_all(&conn).unwrap();
+
+        let service_kind: String = conn
+            .query_row(
+                "SELECT service_kind FROM cfg_services WHERE socket_id = ?1",
+                ["legacy-socket"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(service_kind, "driver");
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_session_exec_ctx_json_migration_skips_when_session_tabs_table_is_absent() {
+        let temp_dir = temp_dir("exec_ctx_json_missing_table");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE sys_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))",
+            [],
+        )
+        .unwrap();
+
+        let registry = MigrationRegistry::new();
+        registry.run_all(&conn).unwrap();
+
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sys_migrations WHERE name = '007_session_exec_ctx_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_010_all_viz_tables_present() {
+        let temp_dir = temp_dir("010_viz_tables");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        MigrationRegistry::new().run_all(&conn).unwrap();
+
+        let tables = table_names(&conn);
+
+        for expected in &[
+            "viz_saved_charts",
+            "viz_saved_chart_series",
+            "viz_saved_chart_binding_y",
+            "viz_dashboards",
+            "viz_dashboard_panels",
+        ] {
+            assert!(
+                tables.contains(*expected),
+                "table '{expected}' should exist after migration 010"
+            );
+        }
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_010_idempotent_rerun() {
+        let temp_dir = temp_dir("010_idempotent");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let registry = MigrationRegistry::new();
+
+        registry.run_all(&conn).unwrap();
+        // Second run must not error and all viz tables must still be present.
+        registry.run_all(&conn).unwrap();
+
+        let tables = table_names(&conn);
+        for expected in &[
+            "viz_saved_charts",
+            "viz_saved_chart_series",
+            "viz_saved_chart_binding_y",
+            "viz_dashboards",
+            "viz_dashboard_panels",
+        ] {
+            assert!(
+                tables.contains(*expected),
+                "table '{expected}' must still be present after idempotent rerun"
+            );
+        }
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    struct FailingMigration;
+
+    impl Migration for FailingMigration {
+        fn name(&self) -> &str {
+            "000_failing_test_migration"
+        }
+
+        fn run(&self, _tx: &Transaction) -> Result<(), MigrationError> {
+            Err(MigrationError::Failed {
+                name: self.name().to_owned(),
+                details: "injected failure".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn test_first_migration_failure_rolls_back_sys_table() {
+        let temp_dir = temp_dir("first_fail_rollback");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let mut registry = MigrationRegistry {
+                migrations: Vec::new(),
+            };
+            registry.register(FailingMigration);
+
+            assert!(
+                registry.run_all(&conn).is_err(),
+                "run_all must return Err when first migration fails"
+            );
+        }
+
+        let conn2 = Connection::open(&db_path).unwrap();
+        let tables = table_names(&conn2);
+        assert!(
+            !tables.contains("sys_migrations"),
+            "sys_migrations must not exist after a rolled-back first migration"
+        );
+
+        drop(conn2);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_run_all_recovers_from_partial_first_migration_crash() {
+        let temp_dir = temp_dir("partial_crash");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE sys_migrations (name TEXT PRIMARY KEY, \
+                 applied_at TEXT NOT NULL DEFAULT (datetime('now')))",
+                [],
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open(&db_path).unwrap();
+        let registry = MigrationRegistry::new();
+        registry
+            .run_all(&conn)
+            .expect("run_all must recover from empty sys_migrations");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sys_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, registry.migrations.len() as i64);
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Asserts that the full ordered `name()` sequence of the migration registry
+    /// remains byte-for-byte identical after any refactoring of the source files.
+    ///
+    /// The `sys_migrations` table keys rows by `name()`, so renaming a `name()`
+    /// string re-runs that migration on every existing user database. This test
+    /// is the regression fence for that invariant: it is written against the
+    /// current (pre-rename) state and must stay green through file renames.
+    #[test]
+    fn test_023_profile_hook_interpreter_upgrades_and_is_idempotent() {
+        let temp_dir = temp_dir("023_profile_hook_interpreter");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let registry = MigrationRegistry::new();
+        registry.run_all(&conn).expect("create pre-023 schema");
+        conn.execute_batch(
+            "ALTER TABLE cfg_connection_profile_hooks DROP COLUMN script_interpreter;
+             DELETE FROM sys_migrations WHERE name = '023_profile_hook_interpreter';",
+        )
+        .expect("restore pre-023 profile hook schema");
+
+        registry
+            .run_all(&conn)
+            .expect("upgrade profile hook schema");
+        assert!(
+            column_names(&conn, "cfg_connection_profile_hooks").contains("script_interpreter"),
+            "migration 023 must add the profile hook interpreter column"
+        );
+
+        registry
+            .run_all(&conn)
+            .expect("rerun profile hook schema upgrade");
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sys_migrations WHERE name = '023_profile_hook_interpreter'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count migration applications");
+        assert_eq!(applied, 1);
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_migration_name_order_invariant() {
+        let temp_dir = temp_dir("name_order");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let registry = MigrationRegistry::new();
+
+        let expected: Vec<&str> = vec![
+            "001_initial",
+            "002_audit_extended",
+            "003_audit_settings",
+            "004_audit_saved_filters",
+            "005_rpc_service_kind",
+            "006_rpc_service_api_contract",
+            "007_session_exec_ctx_json",
+            "008_general_settings_style",
+            "009_mssql_instance",
+            "010_aws_reflect_migration_flag",
+            "011_connection_drop_auth_profile_fk",
+            "010_viz_charts_and_dashboards",
+            "011_viz_saved_chart_metric_source",
+            "012_viz_saved_chart_metric_series",
+            "013_viz_dashboard_panel_kind",
+            "014_audit_settings_log_capture_min_level",
+            "014_viz_inspector_and_instance_metric",
+            "015_viz_inspector_saved_chart_id_constraint",
+            "016_viz_divider_saved_chart_id_constraint",
+            "017_qry_saved_queries",
+            "018_app_pending_executions",
+            "019_hook_env_denylist",
+            "020_sch_schema_snapshots",
+            "021_general_settings_schema_snapshot_retention",
+            "022_hook_kind_json",
+            "023_profile_hook_interpreter",
+            "024_s3_config_columns",
+            "025_general_settings_object_preview_limit",
+            "026_general_settings_language",
+            "027_general_settings_ui_font",
+            "028_general_settings_theme_mode",
+        ];
+
+        let pending = registry.get_pending(&conn).unwrap();
+        let actual: Vec<&str> = pending.iter().map(|m| m.name()).collect();
+
+        assert_eq!(
+            actual, expected,
+            "migration name() strings or registration order changed — \
+             name() strings are frozen keys in sys_migrations and must never be renamed"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+}

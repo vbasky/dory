@@ -1,0 +1,79 @@
+[package]
+name = "dory"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dory"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+dory_app.workspace = true
+dory_ui = { workspace = true }
+dory_core = { workspace = true, features = ["tracing-bridge"] }
+dory_i18n.workspace = true
+dory_ipc.workspace = true
+dory_driver_ipc.workspace = true
+dory_audit.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+log.workspace = true
+interprocess.workspace = true
+# rustls 0.23 refuses to auto-select a crypto provider when more than one
+# backend is linked. This workspace links several (the AWS SDK pulls `ring`,
+# reqwest and the TLS drivers pull `aws-lc-rs`), so the binary installs a
+# process-wide default in `main`. Declared here to reach `rustls::crypto`.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The binary registers drivers and runtime features through `dory_app`, not
+# directly. Optional dep declarations on driver crates would be dead weight
+# (no `use ...` in this crate), so they live on `dory_app` instead. The few
+# optional deps below exist only for feature passthroughs that this manifest
+# itself exposes (e.g. `vendored-openssl` on `dory_ssh`).
+
+[dependencies.dory_ssh]
+workspace = true
+optional = true
+
+[features]
+default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "dynamodb", "cloudwatch", "influxdb", "mssql", "redshift", "clickhouse", "s3", "lua", "aws", "mcp"]
+# dory_ui is driver-agnostic, so driver features only drive dory_app (which
+# registers the drivers and relays to the MCP server). The binary does not need
+# to declare driver/runtime crates as direct optional deps — `dory_app/<feat>`
+# pulls them in through dory_app's own optional deps.
+sqlite = ["dory_app/sqlite"]
+postgres = ["dory_app/postgres"]
+mysql = ["dory_app/mysql"]
+mongodb = ["dory_app/mongodb"]
+redis = ["dory_app/redis"]
+dynamodb = ["dory_app/dynamodb"]
+cloudwatch = ["dory_app/cloudwatch"]
+influxdb = ["dory_app/influxdb"]
+mssql = ["dory_app/mssql"]
+redshift = ["dory_app/redshift"]
+clickhouse = ["dory_app/clickhouse"]
+s3 = ["dory_app/s3"]
+lua = ["dory_app/lua", "dory_ui/lua"]
+aws = ["dory_app/aws", "dory_ui/aws"]
+mcp = ["dory_app/mcp", "dory_ui/mcp"]
+vendored-openssl = ["dory_ssh/vendored-openssl"]
+
+[dev-dependencies]
+dory_test_support.workspace = true
+
+[package.metadata.cargo-machete]
+# tokio is declared to pin the rt-multi-thread+time features for the MCP runtime;
+# no direct tokio:: calls appear in this crate's source because the runtime is
+# driven through dory_app/dory_mcp_server.
+# dory_ssh is an optional dep forwarded only to enable the vendored-openssl
+# feature on the ssh crate; no source-level use of dory_ssh is needed.
+ignored = ["tokio", "dory_ssh"]

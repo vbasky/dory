@@ -1,0 +1,41 @@
+[package]
+name = "dory_ui_sidebar"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Connection and scripts sidebar tree for Dory"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+dory_ui_base.workspace = true
+dory_components.workspace = true
+dory_core.workspace = true
+dory_i18n.workspace = true
+dory_app.workspace = true
+dory_ssh.workspace = true
+uuid.workspace = true
+log.workspace = true
+rfd.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+dory_storage.workspace = true
+rusqlite.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+
+[features]
+default = []
+# Passthroughs: sidebar code has no direct mcp/lua/aws gates, but these must
+# forward to every dependency that also exposes them (dory_app, dory_ui_base)
+# so the feature set stays unified regardless of build entry point and dory_app
+# is never compiled twice with mismatched features.
+# Note: dory_ui_windows features are forwarded by dory_ui directly.
+mcp = ["dory_app/mcp", "dory_ui_base/mcp"]
+lua = ["dory_app/lua", "dory_ui_base/lua"]
+aws = ["dory_app/aws", "dory_ui_base/aws"]

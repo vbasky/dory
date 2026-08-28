@@ -1,0 +1,50 @@
+name: ${PKG_NAME}
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: 1
+section: utility
+priority: optional
+maintainer: Dory contributors
+description: |
+  A fast, keyboard-first database client for SQL and NoSQL databases.
+homepage: https://github.com/vbasky/dory
+license: MIT
+depends:
+  - libc6
+  - libdbus-1-3
+  - libgcc-s1
+  - libssl3
+  - libsystemd0
+  - libxcb1
+  - libxkbcommon0
+  - libxkbcommon-x11-0
+recommends:
+  - fontconfig
+  - hicolor-icon-theme
+  - xdg-utils
+contents:
+  - src: target/${TARGET}/release/dory
+    dst: /usr/bin/${APP_ID}
+  - src: packaging/dory.desktop
+    dst: /usr/share/applications/${APP_ID}.desktop
+  - src: packaging/icons/256x256/apps/dory.png
+    dst: /usr/share/icons/hicolor/256x256/apps/${APP_ID}.png
+  - src: packaging/icons/128x128/apps/dory.png
+    dst: /usr/share/icons/hicolor/128x128/apps/${APP_ID}.png
+  - src: packaging/icons/64x64/apps/dory.png
+    dst: /usr/share/icons/hicolor/64x64/apps/${APP_ID}.png
+  - src: packaging/icons/48x48/apps/dory.png
+    dst: /usr/share/icons/hicolor/48x48/apps/${APP_ID}.png
+  - src: packaging/icons/32x32/apps/dory.png
+    dst: /usr/share/icons/hicolor/32x32/apps/${APP_ID}.png
+  - src: packaging/icons/16x16/apps/dory.png
+    dst: /usr/share/icons/hicolor/16x16/apps/${APP_ID}.png
+  - src: ${BRAND_DIR}/mark.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/${APP_ID}.svg
+  - src: LICENSE-MIT
+    dst: /usr/share/licenses/${APP_ID}/LICENSE-MIT
+  - src: LICENSE-APACHE
+    dst: /usr/share/licenses/${APP_ID}/LICENSE-APACHE
+scripts:
+  postinstall: packaging/scripts/postinst

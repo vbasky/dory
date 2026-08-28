@@ -1,0 +1,2973 @@
+//! Configuration loader that reads and writes all durable config from `dory.db` repositories.
+//!
+//! This is the authoritative config-loading path for the app.
+
+use std::collections::HashMap;
+
+use dory_core::{
+    AccessKind, ConnectionHook, ConnectionHookBindings, ConnectionHooks, ConnectionMcpGovernance,
+    ConnectionMcpPolicyBinding, ConnectionProfile, DbKind, DriverKey, FormValues, GeneralSettings,
+    GlobalOverrides, HookExecutionMode, HookFailureMode, HookKind, HookPhase, ProxyProfile,
+    RpcServiceKind, ScriptLanguage, ScriptSource, ServiceConfig, SshTunnelProfile, ValueRef,
+};
+use dory_storage::bootstrap::StorageRuntime;
+use dory_storage::repositories::connection_driver_configs::ConnectionDriverConfigDto;
+use dory_storage::repositories::connection_profile_governance_binding_policies::ConnectionProfileGovernanceBindingPolicyDto;
+use dory_storage::repositories::connection_profile_governance_binding_roles::ConnectionProfileGovernanceBindingRoleDto;
+use dory_storage::repositories::connection_profile_governance_bindings::ConnectionProfileGovernanceBindingDto;
+use dory_storage::repositories::connection_profile_hook_bindings::ConnectionProfileHookBindingDto;
+use dory_storage::repositories::connection_profile_hooks::ConnectionProfileHookDto;
+use dory_storage::repositories::connection_profile_settings::ConnectionProfileSettingDto;
+use dory_storage::repositories::connection_profile_value_refs::ConnectionProfileValueRefDto;
+use dory_storage::repositories::connection_profiles::ConnectionProfileDto;
+use dory_storage::repositories::driver_overrides::DriverOverridesDto;
+use dory_storage::repositories::driver_setting_values::DriverSettingValueDto;
+use dory_storage::repositories::general_settings::GeneralSettingsDto;
+use dory_storage::repositories::hook_definitions::{HookDefinitionDto, HookDefinitionReplacement};
+
+pub fn save_general_settings(
+    runtime: &StorageRuntime,
+    settings: &GeneralSettings,
+) -> Result<(), dory_storage::error::StorageError> {
+    // Save to normalized general_settings table
+    let repo = runtime.general_settings();
+    let dto = GeneralSettingsDto {
+        id: 1,
+        theme: settings.theme.as_storage_str().to_string(),
+        theme_mode: settings.theme_mode.as_storage_str().to_string(),
+        dark_theme: settings
+            .dark_theme
+            .ensure_dark()
+            .as_storage_str()
+            .to_string(),
+        light_theme: settings
+            .light_theme
+            .ensure_light()
+            .as_storage_str()
+            .to_string(),
+        restore_session_on_startup: if settings.restore_session_on_startup {
+            1
+        } else {
+            0
+        },
+        reopen_last_connections: if settings.reopen_last_connections {
+            1
+        } else {
+            0
+        },
+        default_focus_on_startup: match settings.default_focus_on_startup {
+            dory_core::StartupFocus::LastTab => "last_tab".to_string(),
+            dory_core::StartupFocus::Sidebar => "sidebar".to_string(),
+        },
+        max_history_entries: settings.max_history_entries as i64,
+        auto_save_interval_ms: settings.auto_save_interval_ms as i64,
+        default_refresh_policy: match settings.default_refresh_policy {
+            dory_core::RefreshPolicySetting::Interval => "interval".to_string(),
+            dory_core::RefreshPolicySetting::Manual => "manual".to_string(),
+        },
+        default_refresh_interval_secs: settings.default_refresh_interval_secs as i32,
+        max_concurrent_background_tasks: settings.max_concurrent_background_tasks as i64,
+        auto_refresh_pause_on_error: if settings.auto_refresh_pause_on_error {
+            1
+        } else {
+            0
+        },
+        auto_refresh_only_if_visible: if settings.auto_refresh_only_if_visible {
+            1
+        } else {
+            0
+        },
+        confirm_dangerous_queries: if settings.confirm_dangerous_queries {
+            1
+        } else {
+            0
+        },
+        dangerous_requires_where: if settings.dangerous_requires_where {
+            1
+        } else {
+            0
+        },
+        dangerous_requires_preview: if settings.dangerous_requires_preview {
+            1
+        } else {
+            0
+        },
+        style: match settings.style {
+            dory_core::AppStyle::Default => "default".to_string(),
+            dory_core::AppStyle::Compact => "compact".to_string(),
+        },
+        schema_snapshot_retention: settings.schema_snapshot_retention as i64,
+        object_preview_size_limit_mib: settings.object_preview_size_limit_mib as i64,
+        language: settings.language.clone(),
+        ui_font: font_setting_to_storage(&settings.ui_font),
+        updated_at: String::new(),
+    };
+    repo.upsert(&dto)?;
+
+    Ok(())
+}
+
+pub fn save_driver_settings(
+    runtime: &StorageRuntime,
+    overrides: &HashMap<DriverKey, GlobalOverrides>,
+    settings: &HashMap<DriverKey, FormValues>,
+) -> Result<(), dory_storage::error::StorageError> {
+    let overrides_repo = runtime.driver_overrides();
+    let values_repo = runtime.driver_setting_values();
+
+    let existing_overrides = overrides_repo.all().unwrap_or_default();
+    let existing_overrides_keys: std::collections::HashSet<_> = existing_overrides
+        .iter()
+        .map(|d| d.driver_key.clone())
+        .collect();
+
+    // Build the full set of keys present in the desired state.
+    let desired: std::collections::HashSet<_> =
+        overrides.keys().chain(settings.keys()).cloned().collect();
+
+    for key in &desired {
+        if let Some(ov) = overrides.get(key) {
+            let dto = DriverOverridesDto {
+                driver_key: key.clone(),
+                refresh_policy: ov.refresh_policy.map(|rp| match rp {
+                    dory_core::RefreshPolicySetting::Interval => "interval".to_string(),
+                    dory_core::RefreshPolicySetting::Manual => "manual".to_string(),
+                }),
+                refresh_interval_secs: ov.refresh_interval_secs.map(|v| v as i32),
+                confirm_dangerous: ov.confirm_dangerous.map(|v| if v { 1 } else { 0 }),
+                requires_where: ov.requires_where.map(|v| if v { 1 } else { 0 }),
+                requires_preview: ov.requires_preview.map(|v| if v { 1 } else { 0 }),
+                updated_at: String::new(),
+            };
+            overrides_repo.upsert(&dto)?;
+        } else {
+            if existing_overrides_keys.contains(key) {
+                overrides_repo.delete(key)?;
+            }
+        }
+
+        if let Some(sv) = settings.get(key) {
+            let values: Vec<DriverSettingValueDto> = sv
+                .iter()
+                .map(|(k, v)| DriverSettingValueDto {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    driver_key: key.clone(),
+                    setting_key: k.clone(),
+                    setting_value: Some(v.clone()),
+                })
+                .collect();
+            values_repo.replace_for_driver(key, &values)?;
+        } else {
+            values_repo.delete_for_driver(key)?;
+        }
+    }
+
+    for key in existing_overrides_keys.difference(&desired) {
+        overrides_repo.delete(key)?;
+        values_repo.delete_for_driver(key)?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditableGlobalHook {
+    pub id: Option<String>,
+    pub hook: ConnectionHook,
+}
+
+impl std::ops::Deref for EditableGlobalHook {
+    type Target = ConnectionHook;
+
+    fn deref(&self) -> &Self::Target {
+        &self.hook
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookDefinitionSave {
+    pub id: Option<String>,
+    pub name: String,
+    pub hook: ConnectionHook,
+}
+
+pub fn save_hook_definitions(
+    runtime: &StorageRuntime,
+    hooks: &[HookDefinitionSave],
+    protected_ids: &[String],
+) -> Result<HashMap<String, EditableGlobalHook>, dory_storage::error::StorageError> {
+    let replacements: Result<Vec<_>, _> = hooks.iter().map(hook_definition_replacement).collect();
+    let saved = runtime
+        .hook_definitions()
+        .replace_all_atomic(&replacements?, &protected_ids.iter().cloned().collect())?;
+
+    let hooks_by_id: HashMap<_, _> = hooks
+        .iter()
+        .filter_map(|hook| hook.id.as_ref().map(|id| (id.clone(), hook.hook.clone())))
+        .collect();
+    let hooks_by_name: HashMap<_, _> = hooks
+        .iter()
+        .map(|hook| (hook.name.clone(), hook.hook.clone()))
+        .collect();
+
+    Ok(saved
+        .into_iter()
+        .filter_map(|definition| {
+            let hook = hooks_by_id
+                .get(&definition.id)
+                .or_else(|| hooks_by_name.get(&definition.name))?
+                .clone();
+            Some((
+                definition.name,
+                EditableGlobalHook {
+                    id: Some(definition.id),
+                    hook,
+                },
+            ))
+        })
+        .collect())
+}
+
+fn hook_definition_replacement(
+    hook: &HookDefinitionSave,
+) -> Result<HookDefinitionReplacement, dory_storage::error::StorageError> {
+    let execution_mode = match hook.hook.execution_mode {
+        HookExecutionMode::Blocking => "Blocking",
+        HookExecutionMode::Detached => "Detached",
+    };
+    let on_failure = match hook.hook.on_failure {
+        HookFailureMode::Warn => "Warn",
+        HookFailureMode::Ignore => "Ignore",
+        HookFailureMode::Disconnect => "Disconnect",
+    };
+    let definition_id = hook.id.clone().unwrap_or_default();
+
+    Ok(HookDefinitionReplacement {
+        id: hook.id.clone(),
+        definition: HookDefinitionDto {
+            id: definition_id,
+            name: hook.name.clone(),
+            execution_mode: execution_mode.to_string(),
+            script_ref: None,
+            cwd: hook
+                .hook
+                .cwd
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+            inherit_env: hook.hook.inherit_env,
+            timeout_ms: hook.hook.timeout_ms.map(|value| value as i64),
+            ready_signal: hook.hook.ready_signal.clone(),
+            on_failure: on_failure.to_string(),
+            enabled: hook.hook.enabled,
+            created_at: String::new(),
+            updated_at: String::new(),
+            kind_json: Some(
+                serde_json::to_string(&hook.hook.kind)
+                    .map_err(|error| dory_storage::error::StorageError::Data(error.to_string()))?,
+            ),
+            env_denylist: hook.hook.env_denylist.clone(),
+        },
+        // The canonical hook kind is persisted in `kind_json`; the legacy
+        // `cfg_hook_commands` child row is never read back, so leaving it
+        // unset lets the atomic replace drop any stale row instead of
+        // mirroring dead data.
+        command: None,
+        environment: hook.hook.env.clone(),
+    })
+}
+
+pub fn save_services(
+    runtime: &StorageRuntime,
+    services: &[ServiceConfig],
+) -> Result<(), dory_storage::error::StorageError> {
+    let repo = runtime.services();
+
+    // Propagate read errors from the repository.
+    let existing_rows = repo.all()?;
+    let existing_ids: std::collections::HashSet<_> =
+        existing_rows.iter().map(|d| d.socket_id.clone()).collect();
+
+    // Build the full set of IDs present in the desired state.
+    let desired_ids: std::collections::HashSet<_> =
+        services.iter().map(|s| s.socket_id.clone()).collect();
+
+    // Upsert all services that are in the desired state.
+    for svc in services {
+        let api_contract = svc.api_contract.clone();
+        let dto = dory_storage::repositories::services::ServiceDto {
+            socket_id: svc.socket_id.clone(),
+            enabled: svc.enabled,
+            command: svc.command.clone(),
+            startup_timeout_ms: svc.startup_timeout_ms.map(|v| v as i64),
+            service_kind: rpc_service_kind_to_storage(svc.kind).to_string(),
+            api_family: api_contract
+                .as_ref()
+                .map(|contract| contract.family.clone()),
+            api_major: api_contract.as_ref().map(|contract| contract.major as i64),
+            api_minor: api_contract.as_ref().map(|contract| contract.minor as i64),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        repo.upsert(&dto)?;
+
+        repo.set_args(&svc.socket_id, &svc.args)?;
+        repo.set_env(&svc.socket_id, &svc.env)?;
+    }
+
+    // Delete services that are in DB but not in the desired state.
+    for socket_id in existing_ids.difference(&desired_ids) {
+        repo.delete(socket_id)?;
+    }
+
+    Ok(())
+}
+
+pub fn save_profiles(
+    runtime: &StorageRuntime,
+    profiles: &[ConnectionProfile],
+) -> Result<(), dory_storage::error::StorageError> {
+    let repo = runtime.connection_profiles();
+
+    for profile in profiles {
+        let (access_kind_str, access_provider_str, ssh_tunnel_profile_id_str) =
+            access_kind_columns(&profile.access_kind);
+
+        let dto = ConnectionProfileDto {
+            id: profile.id.to_string(),
+            name: profile.name.clone(),
+            driver_id: Some(profile.driver_id()),
+            description: None,
+            favorite: false,
+            color: None,
+            icon: None,
+            save_password: profile.save_password,
+            kind: Some(db_kind_to_str(profile.kind())),
+            access_kind: access_kind_str,
+            access_provider: access_provider_str,
+            auth_profile_id: profile.auth_profile_id.map(|u| u.to_string()),
+            proxy_profile_id: profile.proxy_profile_id.map(|u| u.to_string()),
+            ssh_tunnel_profile_id: ssh_tunnel_profile_id_str,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        repo.upsert(&dto)?;
+
+        let profile_id = &profile.id.to_string();
+
+        // DbConfig → connection_driver_configs (native columns)
+        let driver_configs_repo = repo.driver_configs();
+        driver_configs_repo.delete_for_profile(profile_id)?;
+        let driver_dto =
+            ConnectionDriverConfigDto::from_db_config(profile_id.to_string(), &profile.config);
+        driver_configs_repo.upsert(&driver_dto)?;
+
+        // settings_overrides → connection_profile_settings with "overrides." prefix
+        let settings_repo = repo.settings();
+        settings_repo.delete_by_key_prefix(profile_id, "overrides.")?;
+        if let Some(ref ov) = profile.settings_overrides {
+            save_global_overrides(&settings_repo, profile_id, ov)?;
+        }
+
+        // connection_settings → connection_profile_settings with "conn." prefix
+        settings_repo.delete_by_key_prefix(profile_id, "conn.")?;
+        if let Some(ref cs) = profile.connection_settings {
+            for (k, v) in cs {
+                let setting_dto = dory_storage::repositories::connection_profile_settings::ConnectionProfileSettingDto::new(
+                    profile_id.clone(),
+                    format!("conn.{}", k),
+                    Some(v.clone()),
+                );
+                settings_repo.upsert(&setting_dto)?;
+            }
+        }
+
+        // hooks → connection_profile_hooks (normalized)
+        let hooks_repo = repo.hooks();
+        let hook_args_repo = repo.hook_args();
+        let hook_envs_repo = repo.hook_envs();
+        hooks_repo.delete_for_profile(profile_id)?;
+        if let Some(ref hooks) = profile.hooks {
+            save_connection_hooks(
+                &hooks_repo,
+                &hook_args_repo,
+                &hook_envs_repo,
+                profile_id,
+                hooks,
+            )?;
+        }
+
+        // hook_bindings → connection_profile_hook_bindings (proper rows)
+        let bindings_repo = repo.hook_bindings();
+        bindings_repo.delete_for_profile(profile_id)?;
+        if let Some(ref bindings) = profile.hook_bindings {
+            save_hook_bindings(&bindings_repo, profile_id, bindings)?;
+        }
+
+        // value_refs → connection_profile_value_refs
+        let value_refs_repo = repo.value_refs();
+        value_refs_repo.delete_for_profile(profile_id)?;
+        for (key, value_ref) in &profile.value_refs {
+            let dto = value_ref_to_dto(profile_id, key, value_ref);
+            value_refs_repo.insert(&dto)?;
+        }
+
+        // access_kind params → connection_profile_access_params
+        let access_params_repo = repo.access_params();
+        access_params_repo.delete_for_profile(profile_id)?;
+        if let Some(AccessKind::Managed { ref params, .. }) = profile.access_kind {
+            access_params_repo.upsert_batch(profile_id, params)?;
+        }
+
+        // mcp_governance → governance table + binding tables
+        let gov_repo = repo.governance();
+        let gov_bindings_repo = repo.governance_bindings();
+        gov_repo.delete_for_profile(profile_id)?;
+        gov_bindings_repo.delete_for_profile(profile_id)?;
+        if let Some(ref gov) = profile.mcp_governance {
+            let enabled_dto =
+                dory_storage::repositories::connection_profile_governance::ConnectionProfileGovernanceDto::new(
+                    profile_id.clone(),
+                    "enabled".to_string(),
+                    Some(gov.enabled.to_string()),
+                );
+            gov_repo.upsert(&enabled_dto)?;
+
+            let gov_binding_roles_repo = repo.governance_binding_roles();
+            let gov_binding_policies_repo = repo.governance_binding_policies();
+            for (i, binding) in gov.policy_bindings.iter().enumerate() {
+                let b_dto = ConnectionProfileGovernanceBindingDto::new(
+                    profile_id.clone(),
+                    binding.actor_id.clone(),
+                    i as i32,
+                );
+                gov_bindings_repo.insert(&b_dto)?;
+                for role_id in &binding.role_ids {
+                    let r_dto = ConnectionProfileGovernanceBindingRoleDto::new(
+                        b_dto.id.clone(),
+                        role_id.clone(),
+                    );
+                    gov_binding_roles_repo.insert(&r_dto)?;
+                }
+                for policy_id in &binding.policy_ids {
+                    let p_dto = ConnectionProfileGovernanceBindingPolicyDto::new(
+                        b_dto.id.clone(),
+                        policy_id.clone(),
+                    );
+                    gov_binding_policies_repo.insert(&p_dto)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn db_kind_to_str(kind: DbKind) -> String {
+    match kind {
+        DbKind::Postgres => "Postgres",
+        DbKind::SQLite => "SQLite",
+        DbKind::MySQL => "MySQL",
+        DbKind::MariaDB => "MariaDB",
+        DbKind::MongoDB => "MongoDB",
+        DbKind::Redis => "Redis",
+        DbKind::DynamoDB => "DynamoDB",
+        DbKind::CloudWatchLogs => "CloudWatchLogs",
+        DbKind::InfluxDB => "InfluxDB",
+        DbKind::SqlServer => "SqlServer",
+        DbKind::Redshift => "Redshift",
+        DbKind::S3 => "S3",
+        DbKind::ClickHouse => "ClickHouse",
+    }
+    .to_string()
+}
+
+fn str_to_db_kind(s: &str) -> Option<DbKind> {
+    match s {
+        "Postgres" => Some(DbKind::Postgres),
+        "SQLite" => Some(DbKind::SQLite),
+        "MySQL" => Some(DbKind::MySQL),
+        "MariaDB" => Some(DbKind::MariaDB),
+        "MongoDB" => Some(DbKind::MongoDB),
+        "Redis" => Some(DbKind::Redis),
+        "DynamoDB" => Some(DbKind::DynamoDB),
+        "CloudWatchLogs" => Some(DbKind::CloudWatchLogs),
+        "InfluxDB" => Some(DbKind::InfluxDB),
+        "SqlServer" => Some(DbKind::SqlServer),
+        "Redshift" => Some(DbKind::Redshift),
+        "S3" => Some(DbKind::S3),
+        "ClickHouse" => Some(DbKind::ClickHouse),
+        _ => None,
+    }
+}
+
+fn default_db_config_for_kind(kind: DbKind) -> dory_core::DbConfig {
+    match kind {
+        DbKind::Postgres => dory_core::DbConfig::default_postgres(),
+        DbKind::SQLite => dory_core::DbConfig::default_sqlite(),
+        DbKind::MySQL | DbKind::MariaDB => dory_core::DbConfig::default_mysql(),
+        DbKind::MongoDB => dory_core::DbConfig::default_mongodb(),
+        DbKind::Redis => dory_core::DbConfig::default_redis(),
+        DbKind::DynamoDB => dory_core::DbConfig::default_dynamodb(),
+        DbKind::CloudWatchLogs => dory_core::DbConfig::default_cloudwatch_logs(),
+        DbKind::InfluxDB => dory_core::DbConfig::default_influxdb(),
+        DbKind::SqlServer => dory_core::DbConfig::default_sqlserver(),
+        DbKind::Redshift => dory_core::DbConfig::default_redshift(),
+        DbKind::S3 => dory_core::DbConfig::default_s3(),
+        DbKind::ClickHouse => dory_core::DbConfig::default_clickhouse(),
+    }
+}
+
+fn access_kind_columns(
+    access_kind: &Option<AccessKind>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    match access_kind {
+        None => (None, None, None),
+        Some(AccessKind::Direct) => (Some("direct".to_string()), None, None),
+        Some(AccessKind::Ssh {
+            ssh_tunnel_profile_id,
+        }) => (
+            Some("ssh".to_string()),
+            None,
+            Some(ssh_tunnel_profile_id.to_string()),
+        ),
+        Some(AccessKind::Proxy {
+            proxy_profile_id: _,
+        }) => (Some("proxy".to_string()), None, None),
+        Some(AccessKind::Managed { provider, .. }) => {
+            (Some("managed".to_string()), Some(provider.clone()), None)
+        }
+    }
+}
+
+fn save_global_overrides(
+    settings_repo: &dory_storage::repositories::connection_profile_settings::ConnectionProfileSettingsRepository,
+    profile_id: &str,
+    ov: &GlobalOverrides,
+) -> Result<(), dory_storage::error::StorageError> {
+    use dory_core::RefreshPolicySetting;
+    use dory_storage::repositories::connection_profile_settings::ConnectionProfileSettingDto;
+
+    if let Some(ref policy) = ov.refresh_policy {
+        let v = match policy {
+            RefreshPolicySetting::Interval => "interval",
+            RefreshPolicySetting::Manual => "manual",
+        };
+        settings_repo.upsert(&ConnectionProfileSettingDto::new(
+            profile_id.to_string(),
+            "overrides.refresh_policy".to_string(),
+            Some(v.to_string()),
+        ))?;
+    }
+    if let Some(secs) = ov.refresh_interval_secs {
+        settings_repo.upsert(&ConnectionProfileSettingDto::new(
+            profile_id.to_string(),
+            "overrides.refresh_interval_secs".to_string(),
+            Some(secs.to_string()),
+        ))?;
+    }
+    if let Some(v) = ov.confirm_dangerous {
+        settings_repo.upsert(&ConnectionProfileSettingDto::new(
+            profile_id.to_string(),
+            "overrides.confirm_dangerous".to_string(),
+            Some(v.to_string()),
+        ))?;
+    }
+    if let Some(v) = ov.requires_where {
+        settings_repo.upsert(&ConnectionProfileSettingDto::new(
+            profile_id.to_string(),
+            "overrides.requires_where".to_string(),
+            Some(v.to_string()),
+        ))?;
+    }
+    if let Some(v) = ov.requires_preview {
+        settings_repo.upsert(&ConnectionProfileSettingDto::new(
+            profile_id.to_string(),
+            "overrides.requires_preview".to_string(),
+            Some(v.to_string()),
+        ))?;
+    }
+    Ok(())
+}
+
+fn save_connection_hooks(
+    hooks_repo: &dory_storage::repositories::connection_profile_hooks::ConnectionProfileHooksRepository,
+    hook_args_repo: &dory_storage::repositories::connection_profile_hook_args::ConnectionProfileHookArgsRepository,
+    hook_envs_repo: &dory_storage::repositories::connection_profile_hook_envs::ConnectionProfileHookEnvsRepository,
+    profile_id: &str,
+    hooks: &ConnectionHooks,
+) -> Result<(), dory_storage::error::StorageError> {
+    let phases = [
+        (HookPhase::PreConnect, "pre_connect"),
+        (HookPhase::PostConnect, "post_connect"),
+        (HookPhase::PreDisconnect, "pre_disconnect"),
+        (HookPhase::PostDisconnect, "post_disconnect"),
+    ];
+
+    for (phase, phase_str) in &phases {
+        for (i, hook) in hooks.phase_hooks(*phase).iter().enumerate() {
+            let hook_dto = connection_hook_to_dto(profile_id, phase_str, i as i32, hook);
+            let hook_id = hook_dto.id.clone();
+            hooks_repo.insert(&hook_dto)?;
+
+            // args
+            if let HookKind::Command { ref args, .. } = hook.kind {
+                hook_args_repo.insert_batch(&hook_id, args)?;
+            }
+
+            // env
+            hook_envs_repo.insert_batch(&hook_id, &hook.env)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn connection_hook_to_dto(
+    profile_id: &str,
+    phase: &str,
+    order_index: i32,
+    hook: &ConnectionHook,
+) -> ConnectionProfileHookDto {
+    let execution_mode = match hook.execution_mode {
+        HookExecutionMode::Blocking => "blocking",
+        HookExecutionMode::Detached => "detached",
+    };
+    let on_failure = match hook.on_failure {
+        HookFailureMode::Disconnect => "disconnect",
+        HookFailureMode::Warn => "warn",
+        HookFailureMode::Ignore => "ignore",
+    };
+
+    let mut dto = ConnectionProfileHookDto {
+        id: uuid::Uuid::new_v4().to_string(),
+        profile_id: profile_id.to_string(),
+        phase: phase.to_string(),
+        order_index,
+        enabled: hook.enabled,
+        hook_kind: String::new(),
+        command: None,
+        script_language: None,
+        script_source_type: None,
+        script_content: None,
+        script_path: None,
+        script_interpreter: None,
+        lua_source_type: None,
+        lua_content: None,
+        lua_path: None,
+        lua_log: true,
+        lua_env_read: true,
+        lua_conn_metadata: true,
+        lua_process_run: false,
+        cwd: hook.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
+        inherit_env: hook.inherit_env,
+        timeout_ms: hook.timeout_ms.map(|v| v as i64),
+        execution_mode: execution_mode.to_string(),
+        ready_signal: hook.ready_signal.clone(),
+        on_failure: on_failure.to_string(),
+        env_denylist: hook.env_denylist.clone(),
+    };
+
+    match &hook.kind {
+        HookKind::Command { command, .. } => {
+            dto.hook_kind = "command".to_string();
+            dto.command = Some(command.clone());
+        }
+        HookKind::Script {
+            language,
+            source,
+            interpreter,
+        } => {
+            dto.hook_kind = "script".to_string();
+            dto.script_language = Some(match language {
+                ScriptLanguage::Bash => "bash".to_string(),
+                ScriptLanguage::Python => "python".to_string(),
+            });
+            dto.script_interpreter = interpreter.clone();
+            match source {
+                ScriptSource::Inline { content } => {
+                    dto.script_source_type = Some("inline".to_string());
+                    dto.script_content = Some(content.clone());
+                }
+                ScriptSource::File { path } => {
+                    dto.script_source_type = Some("file".to_string());
+                    dto.script_path = Some(path.to_string_lossy().to_string());
+                }
+            }
+        }
+        HookKind::Lua {
+            source,
+            capabilities,
+        } => {
+            dto.hook_kind = "lua".to_string();
+            dto.lua_log = capabilities.logging;
+            dto.lua_env_read = capabilities.env_read;
+            dto.lua_conn_metadata = capabilities.connection_metadata;
+            dto.lua_process_run = capabilities.process_run;
+            match source {
+                ScriptSource::Inline { content } => {
+                    dto.lua_source_type = Some("inline".to_string());
+                    dto.lua_content = Some(content.clone());
+                }
+                ScriptSource::File { path } => {
+                    dto.lua_source_type = Some("file".to_string());
+                    dto.lua_path = Some(path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    dto
+}
+
+fn save_hook_bindings(
+    bindings_repo: &dory_storage::repositories::connection_profile_hook_bindings::ConnectionProfileHookBindingsRepository,
+    profile_id: &str,
+    bindings: &ConnectionHookBindings,
+) -> Result<(), dory_storage::error::StorageError> {
+    use dory_storage::repositories::connection_profile_hook_bindings::ConnectionProfileHookBindingDto;
+
+    let phases = [
+        (HookPhase::PreConnect, "pre_connect"),
+        (HookPhase::PostConnect, "post_connect"),
+        (HookPhase::PreDisconnect, "pre_disconnect"),
+        (HookPhase::PostDisconnect, "post_disconnect"),
+    ];
+
+    for (phase, phase_str) in &phases {
+        for (i, hook_id) in bindings.phase_bindings(*phase).iter().enumerate() {
+            let dto = ConnectionProfileHookBindingDto::new(
+                profile_id.to_string(),
+                hook_id.clone(),
+                phase_str.to_string(),
+                i as i32,
+            );
+            bindings_repo.insert(&dto)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn value_ref_to_dto(
+    profile_id: &str,
+    key: &str,
+    value_ref: &ValueRef,
+) -> ConnectionProfileValueRefDto {
+    match value_ref {
+        ValueRef::Literal { value } => ConnectionProfileValueRefDto::new_literal(
+            profile_id.to_string(),
+            key.to_string(),
+            value.clone(),
+        ),
+        ValueRef::Env { key: env_key } => ConnectionProfileValueRefDto::new_env(
+            profile_id.to_string(),
+            key.to_string(),
+            env_key.clone(),
+        ),
+        ValueRef::Secret {
+            provider,
+            locator,
+            json_key,
+        } => ConnectionProfileValueRefDto::new_secret(
+            profile_id.to_string(),
+            key.to_string(),
+            provider.clone(),
+            locator.clone(),
+            json_key.clone(),
+        ),
+        ValueRef::Parameter {
+            provider,
+            name,
+            json_key,
+        } => ConnectionProfileValueRefDto::new_param(
+            profile_id.to_string(),
+            key.to_string(),
+            provider.clone(),
+            name.clone(),
+            json_key.clone(),
+        ),
+        ValueRef::Auth { field } => ConnectionProfileValueRefDto::new_auth(
+            profile_id.to_string(),
+            key.to_string(),
+            field.clone(),
+        ),
+    }
+}
+
+pub fn save_auth_profiles(
+    runtime: &StorageRuntime,
+    profiles: &[dory_core::AuthProfile],
+) -> Result<(), dory_storage::error::StorageError> {
+    let repo = runtime.auth_profiles();
+
+    // Propagate read errors from the repository.
+    let existing_rows = repo.all()?;
+    let existing_ids: std::collections::HashSet<_> =
+        existing_rows.iter().map(|d| d.id.clone()).collect();
+
+    // Build the full set of IDs present in the desired state.
+    let desired_ids: std::collections::HashSet<_> =
+        profiles.iter().map(|p| p.id.to_string()).collect();
+
+    for profile in profiles {
+        let dto = dory_storage::repositories::auth_profiles::AuthProfileDto {
+            id: profile.id.to_string(),
+            name: profile.name.clone(),
+            provider_id: profile.provider_id.clone(),
+            enabled: profile.enabled,
+            created_at: String::new(),
+            updated_at: String::new(),
+            dangling_origin: None,
+        };
+
+        // Secret-kind fields are persisted as keyring-reference markers only;
+        // the values themselves are written to the keyring by the caller
+        // (AppState), never to SQLite. `fields` already excludes them.
+        let secret_refs: std::collections::HashMap<String, String> = profile
+            .secret_fields
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    dory_core::auth_field_secret_ref(&profile.id, key),
+                )
+            })
+            .collect();
+
+        if existing_ids.contains(&dto.id) {
+            repo.update(&dto)?;
+        } else {
+            repo.insert(&dto)?;
+        }
+
+        repo.set_fields_and_secrets(&dto.id, &profile.fields, &secret_refs)?;
+    }
+
+    // Delete profiles that are in DB but not in the desired state.
+    for row in &existing_rows {
+        if !desired_ids.contains(&row.id) {
+            repo.delete(&row.id)?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn save_proxy_profiles(
+    runtime: &StorageRuntime,
+    profiles: &[ProxyProfile],
+) -> Result<(), dory_storage::error::StorageError> {
+    let repo = runtime.proxy_profiles();
+
+    for profile in profiles {
+        let kind_str = match profile.kind {
+            dory_core::ProxyKind::Http => "Http",
+            dory_core::ProxyKind::Https => "Https",
+            dory_core::ProxyKind::Socks5 => "Socks5",
+        };
+
+        let dto = dory_storage::repositories::proxy_profiles::ProxyProfileDto {
+            id: profile.id.to_string(),
+            name: profile.name.clone(),
+            kind: kind_str.to_string(),
+            host: profile.host.clone(),
+            port: profile.port as i32,
+            auth_kind: match &profile.auth {
+                dory_core::ProxyAuth::None => "none".to_string(),
+                dory_core::ProxyAuth::Basic { .. } => "basic".to_string(),
+            },
+            no_proxy: profile.no_proxy.clone(),
+            enabled: profile.enabled,
+            save_secret: profile.save_secret,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        // Convert ProxyAuth to ProxyAuthDto for child table
+        let auth_dto = match &profile.auth {
+            dory_core::ProxyAuth::Basic { username } => {
+                Some(dory_storage::repositories::proxy_auth::ProxyAuthDto {
+                    proxy_profile_id: profile.id.to_string(),
+                    username: Some(username.clone()),
+                    domain: None,
+                    password_secret_ref: None,
+                })
+            }
+            dory_core::ProxyAuth::None => None,
+        };
+
+        repo.upsert(&dto, auth_dto.as_ref())?;
+    }
+
+    Ok(())
+}
+
+pub fn save_ssh_tunnels(
+    runtime: &StorageRuntime,
+    tunnels: &[SshTunnelProfile],
+) -> Result<(), dory_storage::error::StorageError> {
+    let repo = runtime.ssh_tunnels();
+
+    for tunnel in tunnels {
+        let auth_method_str = match &tunnel.config.auth_method {
+            dory_core::SshAuthMethod::PrivateKey { .. } => "key",
+            dory_core::SshAuthMethod::Password => "password",
+        };
+
+        let dto = dory_storage::repositories::ssh_tunnel_profiles::SshTunnelProfileDto {
+            id: tunnel.id.to_string(),
+            name: tunnel.name.clone(),
+            host: tunnel.config.host.clone(),
+            port: tunnel.config.port as i32,
+            user: tunnel.config.user.clone(),
+            auth_method: auth_method_str.to_string(),
+            key_path: None,
+            passphrase_secret_ref: None,
+            password_secret_ref: None,
+            save_secret: tunnel.save_secret,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        // Convert SshAuthMethod to SshTunnelAuthDto for child table
+        let auth_dto = match &tunnel.config.auth_method {
+            dory_core::SshAuthMethod::PrivateKey { key_path } => Some(
+                dory_storage::repositories::ssh_tunnel_auth::SshTunnelAuthDto {
+                    ssh_tunnel_profile_id: tunnel.id.to_string(),
+                    key_path: key_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                    password_secret_ref: None,
+                    passphrase_secret_ref: None,
+                },
+            ),
+            dory_core::SshAuthMethod::Password => Some(
+                dory_storage::repositories::ssh_tunnel_auth::SshTunnelAuthDto {
+                    ssh_tunnel_profile_id: tunnel.id.to_string(),
+                    key_path: None,
+                    password_secret_ref: Some("dory:secret:ssh:password:placeholder".to_string()),
+                    passphrase_secret_ref: None,
+                },
+            ),
+        };
+
+        repo.upsert(&dto, auth_dto.as_ref())?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Configuration loading (read path - already migrated)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookLoadDiagnostic {
+    pub row_id: String,
+    pub row_name: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedHookRow {
+    pub row_id: String,
+    pub row_name: Option<String>,
+}
+
+/// Loaded durable configuration from `dory.db`.
+pub struct LoadedConfig {
+    pub general_settings: GeneralSettings,
+    pub driver_overrides: HashMap<DriverKey, GlobalOverrides>,
+    pub driver_settings: HashMap<DriverKey, FormValues>,
+    pub hook_definitions: HashMap<String, EditableGlobalHook>,
+    pub hook_load_diagnostics: Vec<HookLoadDiagnostic>,
+    pub protected_hook_rows: Vec<ProtectedHookRow>,
+    pub services: Vec<ServiceConfig>,
+    pub profiles: Vec<ConnectionProfile>,
+    pub auth_profiles: Vec<dory_core::AuthProfile>,
+    pub proxy_profiles: Vec<ProxyProfile>,
+    pub ssh_tunnels: Vec<SshTunnelProfile>,
+}
+
+/// Loads all durable config domains from `dory.db`.
+///
+/// Uses sensible defaults when repositories are empty (fresh install).
+/// This function is the single entry point for loading all covered durable config
+/// domains from SQLite storage.
+pub fn load_config(
+    runtime: &StorageRuntime,
+) -> Result<LoadedConfig, dory_storage::error::StorageError> {
+    let profiles_repo = runtime.connection_profiles();
+    let auth_repo = runtime.auth_profiles();
+    let proxy_repo = runtime.proxy_profiles();
+    let ssh_repo = runtime.ssh_tunnels();
+    let hooks_repo = runtime.hook_definitions();
+    let general_settings = load_general_settings(&runtime.general_settings());
+    let (driver_overrides, driver_settings) = load_driver_maps(
+        &runtime.driver_overrides(),
+        &runtime.driver_setting_values(),
+    );
+    let (hook_definitions, hook_load_diagnostics, protected_hook_rows) =
+        load_hook_definitions(&hooks_repo)?;
+    let services = dory_storage::load_service_configs(runtime);
+    let profiles = load_profiles(&profiles_repo);
+    let auth_profiles = load_auth_profiles(&auth_repo);
+    let proxy_profiles = load_proxy_profiles(&proxy_repo, &proxy_repo.auth_repo());
+    let ssh_tunnels = load_ssh_tunnels(&ssh_repo);
+
+    Ok(LoadedConfig {
+        general_settings,
+        driver_overrides,
+        driver_settings,
+        hook_definitions,
+        hook_load_diagnostics,
+        protected_hook_rows,
+        services,
+        profiles,
+        auth_profiles,
+        proxy_profiles,
+        ssh_tunnels,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// General Settings helpers
+// ---------------------------------------------------------------------------
+
+fn load_general_settings(
+    repo: &dory_storage::repositories::general_settings::GeneralSettingsRepository,
+) -> GeneralSettings {
+    let dto = match repo.get() {
+        Ok(Some(dto)) => dto,
+        Ok(None) => {
+            // No settings yet, use defaults
+            return GeneralSettings::default();
+        }
+        Err(e) => {
+            log::warn!("Failed to load general settings, using defaults: {}", e);
+            return GeneralSettings::default();
+        }
+    };
+
+    GeneralSettings {
+        theme: dory_core::ThemeSetting::from_storage_str(&dto.theme),
+        theme_mode: dory_core::ThemeModeSetting::from_storage_str(&dto.theme_mode),
+        dark_theme: dory_core::ThemeSetting::from_storage_str(&dto.dark_theme).ensure_dark(),
+        light_theme: dory_core::ThemeSetting::from_storage_str(&dto.light_theme).ensure_light(),
+        style: app_style_from_storage(&dto.style),
+        ui_font: font_setting_from_storage(&dto.ui_font),
+        restore_session_on_startup: dto.restore_session_on_startup != 0,
+        reopen_last_connections: dto.reopen_last_connections != 0,
+        default_focus_on_startup: match dto.default_focus_on_startup.as_str() {
+            "last_tab" => dory_core::StartupFocus::LastTab,
+            _ => dory_core::StartupFocus::Sidebar,
+        },
+        max_history_entries: dto.max_history_entries as usize,
+        auto_save_interval_ms: dto.auto_save_interval_ms as u64,
+        default_refresh_policy: match dto.default_refresh_policy.as_str() {
+            "interval" => dory_core::RefreshPolicySetting::Interval,
+            _ => dory_core::RefreshPolicySetting::Manual,
+        },
+        default_refresh_interval_secs: dto.default_refresh_interval_secs as u32,
+        max_concurrent_background_tasks: dto.max_concurrent_background_tasks as usize,
+        auto_refresh_pause_on_error: dto.auto_refresh_pause_on_error != 0,
+        auto_refresh_only_if_visible: dto.auto_refresh_only_if_visible != 0,
+        confirm_dangerous_queries: dto.confirm_dangerous_queries != 0,
+        dangerous_requires_where: dto.dangerous_requires_where != 0,
+        dangerous_requires_preview: dto.dangerous_requires_preview != 0,
+        workspace_inspector_width_px: None,
+        schema_snapshot_retention: dto.schema_snapshot_retention as usize,
+        object_preview_size_limit_mib: dto.object_preview_size_limit_mib as u64,
+        language: language_setting_from_storage(&dto.language),
+    }
+}
+
+/// Maps a storage `language` string to a `GeneralSettings::language` value.
+///
+/// The value passes through unvalidated on purpose: the supported set of
+/// languages is derived from the translation catalogs in `dory_i18n`, and
+/// this app/core layer must not duplicate it. `dory_i18n::resolve` treats
+/// any unrecognized value as "follow the system locale", so a stale or
+/// not-yet-shipped language code degrades safely instead of being erased
+/// here and losing the user's choice across an upgrade cycle.
+fn language_setting_from_storage(language: &str) -> String {
+    language.to_string()
+}
+
+/// Maps a storage `style` string to `AppStyle`.
+///
+/// Unknown values (including future variants from a newer binary) fall back to
+/// `AppStyle::Default` so the user always gets a usable UI.
+fn app_style_from_storage(style: &str) -> dory_core::AppStyle {
+    match style {
+        "compact" => dory_core::AppStyle::Compact,
+        _ => dory_core::AppStyle::Default,
+    }
+}
+
+/// Maps a `FontSetting` to its storage identifier — the family name itself,
+/// with the empty string meaning the platform system font.
+fn font_setting_to_storage(font: &dory_core::FontSetting) -> String {
+    font.family.clone()
+}
+
+/// Maps a storage `ui_font` string to `FontSetting`.
+///
+/// The stored value is a font family name; the empty string means the system
+/// font. Nerd Fonts and icon families are rewritten to the system font —
+/// they resolve in GPUI but their glyph metrics collapse hit-testing.
+fn font_setting_from_storage(font: &str) -> dory_core::FontSetting {
+    match font {
+        // "jetbrains_mono" is a legacy sentinel from before the UI font setting
+        // was generalized; it must keep mapping to the system font so databases
+        // written by older builds still load their settings unchanged.
+        "" | "system" | "jetbrains_mono" => dory_core::FontSetting::system(),
+        other => dory_core::FontSetting::named(other).sanitize_for_ui(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hook Definitions helpers
+// ---------------------------------------------------------------------------
+// Driver Maps helpers
+// ---------------------------------------------------------------------------
+
+fn load_driver_maps(
+    overrides_repo: &dory_storage::repositories::driver_overrides::DriverOverridesRepository,
+    values_repo: &dory_storage::repositories::driver_setting_values::DriverSettingValuesRepository,
+) -> (
+    HashMap<DriverKey, GlobalOverrides>,
+    HashMap<DriverKey, FormValues>,
+) {
+    let mut overrides = HashMap::new();
+    let mut settings = HashMap::new();
+
+    if let Ok(entries) = overrides_repo.all() {
+        for entry in entries {
+            let key = entry.driver_key.clone();
+            let refresh_policy = entry.refresh_policy.as_ref().map(|rp| match rp.as_str() {
+                "interval" => dory_core::RefreshPolicySetting::Interval,
+                _ => dory_core::RefreshPolicySetting::Manual,
+            });
+
+            let ov = GlobalOverrides {
+                refresh_policy,
+                refresh_interval_secs: entry.refresh_interval_secs.map(|v| v as u32),
+                confirm_dangerous: entry.confirm_dangerous.map(|v| v != 0),
+                requires_where: entry.requires_where.map(|v| v != 0),
+                requires_preview: entry.requires_preview.map(|v| v != 0),
+            };
+
+            if !ov.is_empty() {
+                overrides.insert(key.clone(), ov);
+            }
+
+            if let Ok(values) = values_repo.get_for_driver(&key) {
+                let mut form_values = FormValues::new();
+                for v in values {
+                    if let Some(val) = v.setting_value {
+                        form_values.insert(v.setting_key, val);
+                    }
+                }
+                if !form_values.is_empty() {
+                    settings.insert(key, form_values);
+                }
+            }
+        }
+    }
+
+    (overrides, settings)
+}
+
+// ---------------------------------------------------------------------------
+// Hook Definitions helpers
+// ---------------------------------------------------------------------------
+
+type LoadedHookDefinitions = (
+    HashMap<String, EditableGlobalHook>,
+    Vec<HookLoadDiagnostic>,
+    Vec<ProtectedHookRow>,
+);
+
+fn load_hook_definitions(
+    repo: &dory_storage::repositories::hook_definitions::HookDefinitionRepository,
+) -> Result<LoadedHookDefinitions, dory_storage::error::StorageError> {
+    let mut map = HashMap::new();
+    let mut diagnostics = Vec::new();
+    let mut protected_rows = Vec::new();
+
+    for dto in repo.all()? {
+        let row_name = Some(dto.name.clone());
+        let kind = match dto.kind_json.as_deref() {
+            Some(kind_json) => match serde_json::from_str(kind_json) {
+                Ok(kind) => kind,
+                Err(error) => {
+                    diagnostics.push(HookLoadDiagnostic {
+                        row_id: dto.id.clone(),
+                        row_name: row_name.clone(),
+                        message: format!("Invalid canonical hook payload: {error}"),
+                    });
+                    protected_rows.push(ProtectedHookRow {
+                        row_id: dto.id,
+                        row_name,
+                    });
+                    continue;
+                }
+            },
+            None => match dto.script_ref.clone() {
+                Some(command) => dory_core::HookKind::Command {
+                    command,
+                    args: Vec::new(),
+                },
+                None => {
+                    diagnostics.push(HookLoadDiagnostic {
+                        row_id: dto.id.clone(),
+                        row_name: row_name.clone(),
+                        message: "Legacy hook row has no unambiguous payload".to_string(),
+                    });
+                    protected_rows.push(ProtectedHookRow {
+                        row_id: dto.id,
+                        row_name,
+                    });
+                    continue;
+                }
+            },
+        };
+
+        let env = match repo.get_env(&dto.id) {
+            Ok(env) => env,
+            Err(error) => {
+                diagnostics.push(HookLoadDiagnostic {
+                    row_id: dto.id.clone(),
+                    row_name: row_name.clone(),
+                    message: format!("Unable to load hook environment: {error}"),
+                });
+                protected_rows.push(ProtectedHookRow {
+                    row_id: dto.id,
+                    row_name,
+                });
+                continue;
+            }
+        };
+
+        let execution_mode = match dto.execution_mode.as_str() {
+            "Detached" => dory_core::HookExecutionMode::Detached,
+            _ => dory_core::HookExecutionMode::Blocking,
+        };
+        let on_failure = match dto.on_failure.as_str() {
+            "Disconnect" => dory_core::HookFailureMode::Disconnect,
+            "Ignore" => dory_core::HookFailureMode::Ignore,
+            _ => dory_core::HookFailureMode::Warn,
+        };
+        let hook = dory_core::ConnectionHook {
+            enabled: dto.enabled,
+            kind,
+            cwd: dto.cwd.as_ref().map(std::path::PathBuf::from),
+            env,
+            inherit_env: dto.inherit_env,
+            env_denylist: dto.env_denylist.clone(),
+            timeout_ms: dto.timeout_ms.map(|v| v as u64),
+            execution_mode,
+            ready_signal: dto.ready_signal.clone(),
+            on_failure,
+        };
+
+        map.insert(
+            dto.name,
+            EditableGlobalHook {
+                id: Some(dto.id),
+                hook,
+            },
+        );
+    }
+
+    Ok((map, diagnostics, protected_rows))
+}
+
+// ---------------------------------------------------------------------------
+// Services helpers
+// ---------------------------------------------------------------------------
+
+fn rpc_service_kind_to_storage(kind: RpcServiceKind) -> &'static str {
+    match kind {
+        RpcServiceKind::Driver => "driver",
+        RpcServiceKind::AuthProvider => "auth_provider",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Profile helpers
+// ---------------------------------------------------------------------------
+
+/// Loads settings_overrides and connection_settings from profile settings DTOs.
+fn load_profile_settings(
+    settings: &[ConnectionProfileSettingDto],
+) -> (Option<GlobalOverrides>, Option<FormValues>) {
+    let mut settings_overrides = GlobalOverrides::default();
+    let mut connection_settings = FormValues::default();
+    let mut has_overrides = false;
+    let mut has_conn_settings = false;
+
+    for setting in settings {
+        let key = &setting.setting_key;
+        let value = setting.setting_value.as_ref();
+
+        if key.starts_with("overrides.") {
+            has_overrides = true;
+            match key.as_str() {
+                "overrides.refresh_policy" => {
+                    if let Some(v) = value {
+                        settings_overrides.refresh_policy = match v.as_str() {
+                            "interval" => Some(dory_core::RefreshPolicySetting::Interval),
+                            "manual" => Some(dory_core::RefreshPolicySetting::Manual),
+                            _ => None,
+                        };
+                    }
+                }
+                "overrides.refresh_interval_secs" => {
+                    if let Some(v) = value {
+                        settings_overrides.refresh_interval_secs = v.parse().ok();
+                    }
+                }
+                "overrides.confirm_dangerous" => {
+                    if let Some(v) = value {
+                        settings_overrides.confirm_dangerous = v.parse().ok();
+                    }
+                }
+                "overrides.requires_where" => {
+                    if let Some(v) = value {
+                        settings_overrides.requires_where = v.parse().ok();
+                    }
+                }
+                "overrides.requires_preview" => {
+                    if let Some(v) = value {
+                        settings_overrides.requires_preview = v.parse().ok();
+                    }
+                }
+                _ => {}
+            }
+        } else if key.starts_with("conn.") {
+            has_conn_settings = true;
+            let conn_key = key.trim_start_matches("conn.").to_string();
+            if let Some(v) = value {
+                connection_settings.insert(conn_key, v.clone());
+            }
+        }
+    }
+
+    let settings_overrides = if has_overrides {
+        Some(settings_overrides)
+    } else {
+        None
+    };
+    let connection_settings = if has_conn_settings {
+        Some(connection_settings)
+    } else {
+        None
+    };
+
+    (settings_overrides, connection_settings)
+}
+
+/// Loads ConnectionHooks from hook DTOs.
+fn load_connection_hooks_from_dtos(
+    hooks: &[ConnectionProfileHookDto],
+    hook_args_repo: &dory_storage::repositories::connection_profile_hook_args::ConnectionProfileHookArgsRepository,
+    hook_envs_repo: &dory_storage::repositories::connection_profile_hook_envs::ConnectionProfileHookEnvsRepository,
+) -> ConnectionHooks {
+    let mut result = ConnectionHooks::default();
+
+    for hook_dto in hooks {
+        let phase = match hook_dto.phase.as_str() {
+            "pre_connect" => HookPhase::PreConnect,
+            "post_connect" => HookPhase::PostConnect,
+            "pre_disconnect" => HookPhase::PreDisconnect,
+            "post_disconnect" => HookPhase::PostDisconnect,
+            _ => continue,
+        };
+
+        let execution_mode = match hook_dto.execution_mode.as_str() {
+            "detached" => HookExecutionMode::Detached,
+            _ => HookExecutionMode::Blocking,
+        };
+
+        let on_failure = match hook_dto.on_failure.as_str() {
+            "disconnect" => HookFailureMode::Disconnect,
+            "ignore" => HookFailureMode::Ignore,
+            _ => HookFailureMode::Warn,
+        };
+
+        let kind = match hook_dto.hook_kind.as_str() {
+            "command" => HookKind::Command {
+                command: hook_dto.command.clone().unwrap_or_default(),
+                args: vec![],
+            },
+            "script" => {
+                let language = match hook_dto.script_language.as_deref() {
+                    Some("python") => ScriptLanguage::Python,
+                    Some("bash") | Some("sh") => ScriptLanguage::Bash,
+                    _ => continue,
+                };
+                let source = match hook_dto.script_source_type.as_deref() {
+                    Some("file") => match hook_dto.script_path.as_ref() {
+                        Some(path) => ScriptSource::File { path: path.into() },
+                        None => continue,
+                    },
+                    _ => ScriptSource::Inline {
+                        content: hook_dto.script_content.clone().unwrap_or_default(),
+                    },
+                };
+
+                HookKind::Script {
+                    language,
+                    source,
+                    interpreter: hook_dto.script_interpreter.clone(),
+                }
+            }
+            "lua" => {
+                let source = match hook_dto.lua_source_type.as_deref() {
+                    Some("file") => match hook_dto.lua_path.as_ref() {
+                        Some(path) => ScriptSource::File { path: path.into() },
+                        None => continue,
+                    },
+                    _ => ScriptSource::Inline {
+                        content: hook_dto.lua_content.clone().unwrap_or_default(),
+                    },
+                };
+
+                HookKind::Lua {
+                    source,
+                    capabilities: dory_core::LuaCapabilities {
+                        logging: hook_dto.lua_log,
+                        env_read: hook_dto.lua_env_read,
+                        connection_metadata: hook_dto.lua_conn_metadata,
+                        process_run: hook_dto.lua_process_run,
+                    },
+                }
+            }
+            _ => continue,
+        };
+
+        let kind = match kind {
+            HookKind::Command { command, .. } => HookKind::Command {
+                command,
+                args: hook_args_repo
+                    .get_for_hook(&hook_dto.id)
+                    .map(|args| args.into_iter().map(|arg| arg.value).collect())
+                    .unwrap_or_default(),
+            },
+            other => other,
+        };
+
+        let hook = ConnectionHook {
+            enabled: hook_dto.enabled,
+            kind,
+            cwd: hook_dto.cwd.as_ref().map(std::path::PathBuf::from),
+            env: hook_envs_repo
+                .get_for_hook(&hook_dto.id)
+                .map(|envs| envs.into_iter().map(|env| (env.key, env.value)).collect())
+                .unwrap_or_default(),
+            inherit_env: hook_dto.inherit_env,
+            env_denylist: hook_dto.env_denylist.clone(),
+            timeout_ms: hook_dto.timeout_ms.map(|v| v as u64),
+            execution_mode,
+            ready_signal: hook_dto.ready_signal.clone(),
+            on_failure,
+        };
+
+        result.phase_hooks_mut(phase).push(hook);
+    }
+
+    result
+}
+
+/// Loads ConnectionHookBindings from binding DTOs.
+fn load_hook_bindings_from_dtos(
+    bindings: &[ConnectionProfileHookBindingDto],
+) -> ConnectionHookBindings {
+    use std::collections::HashMap;
+
+    // Group by phase and sort by order_index
+    let mut by_phase: HashMap<String, Vec<(i32, String)>> = HashMap::new();
+    for b in bindings {
+        by_phase
+            .entry(b.phase.clone())
+            .or_default()
+            .push((b.order_index, b.hook_id.clone()));
+    }
+
+    // Sort each phase's bindings by order_index and extract hook names
+    let mut result = ConnectionHookBindings::default();
+    for (phase, mut items) in by_phase {
+        items.sort_by_key(|k| k.0);
+        let hook_names: Vec<String> = items.into_iter().map(|(_, name)| name).collect();
+        match phase.as_str() {
+            "pre_connect" => result.pre_connect = hook_names,
+            "post_connect" => result.post_connect = hook_names,
+            "pre_disconnect" => result.pre_disconnect = hook_names,
+            "post_disconnect" => result.post_disconnect = hook_names,
+            _ => {}
+        }
+    }
+
+    result
+}
+
+fn load_profiles(
+    repo: &dory_storage::repositories::connection_profiles::ConnectionProfileRepository,
+) -> Vec<ConnectionProfile> {
+    let Ok(dtos) = repo.all() else {
+        return Vec::new();
+    };
+
+    dtos
+        .into_iter()
+        .filter_map(|dto| {
+            let profile_id = &dto.id;
+            let id = uuid::Uuid::parse_str(profile_id).ok()?;
+
+            // Load DbConfig from connection_driver_configs (native columns)
+            let driver_configs_repo = repo.driver_configs();
+            let driver_dto = driver_configs_repo.get_for_profile(profile_id).ok().flatten();
+            let config = driver_dto
+                .and_then(|d| d.to_db_config())
+                .or_else(|| {
+                    // Fallback: construct default config based on kind if driver config is missing
+                    dto.kind.as_ref().and_then(|kind_str| {
+                        let kind = str_to_db_kind(kind_str)?;
+                        Some(default_db_config_for_kind(kind))
+                    })
+                })?;
+
+            // Load settings overrides and connection settings from connection_profile_settings
+            let settings_repo = repo.settings();
+            let settings = settings_repo.get_for_profile(profile_id).ok().unwrap_or_default();
+            let (settings_overrides, connection_settings) = load_profile_settings(&settings);
+
+            // Load value refs from connection_profile_value_refs
+            let value_refs_repo = repo.value_refs();
+            let value_refs = value_refs_repo.get_for_profile(profile_id).ok().unwrap_or_default();
+            let value_refs_map = value_refs
+                .into_iter()
+                .filter_map(|vr| {
+                    let kind = dory_storage::repositories::connection_profile_value_refs::RefKind::try_parse(&vr.ref_kind)?;
+                    let value_ref = match kind {
+                        dory_storage::repositories::connection_profile_value_refs::RefKind::Literal => {
+                            ValueRef::Literal {
+                                value: vr.literal_value.unwrap_or(vr.ref_value),
+                            }
+                        }
+                        dory_storage::repositories::connection_profile_value_refs::RefKind::Env => {
+                            ValueRef::Env {
+                                key: vr.env_key.unwrap_or(vr.ref_value),
+                            }
+                        }
+                        dory_storage::repositories::connection_profile_value_refs::RefKind::Secret => {
+                            ValueRef::Secret {
+                                locator: vr.secret_locator.unwrap_or(vr.ref_value),
+                                provider: vr.ref_provider?,
+                                json_key: vr.ref_json_key,
+                            }
+                        }
+                        dory_storage::repositories::connection_profile_value_refs::RefKind::Param => {
+                            ValueRef::Parameter {
+                                name: vr.param_name.unwrap_or(vr.ref_value),
+                                provider: vr.ref_provider?,
+                                json_key: vr.ref_json_key,
+                            }
+                        }
+                        dory_storage::repositories::connection_profile_value_refs::RefKind::Auth => {
+                            ValueRef::Auth {
+                                field: vr.auth_field.unwrap_or(vr.ref_value),
+                            }
+                        }
+                    };
+                    Some((vr.ref_key, value_ref))
+                })
+                .collect();
+
+            // Load access_kind from connection_profile_access_params
+            let access_params_repo = repo.access_params();
+            let access_params = access_params_repo.get_for_profile(profile_id).ok().unwrap_or_default();
+            let access_kind = if dto.access_kind.as_deref() == Some("direct") {
+                Some(AccessKind::Direct)
+            } else if dto.access_kind.as_deref() == Some("ssh") {
+                dto.ssh_tunnel_profile_id.as_ref().and_then(|s| {
+                    uuid::Uuid::parse_str(s).ok().map(|id| AccessKind::Ssh {
+                        ssh_tunnel_profile_id: id,
+                    })
+                })
+            } else if dto.access_kind.as_deref() == Some("proxy") {
+                dto.proxy_profile_id.as_ref().and_then(|s| {
+                    uuid::Uuid::parse_str(s).ok().map(|id| AccessKind::Proxy {
+                        proxy_profile_id: id,
+                    })
+                })
+            } else if dto.access_kind.as_deref() == Some("managed") {
+                let params = access_params
+                    .into_iter()
+                    .map(|p| (p.param_key, p.param_value))
+                    .collect();
+                Some(AccessKind::Managed {
+                    provider: dto.access_provider.unwrap_or_default(),
+                    params,
+                })
+            } else {
+                None
+            };
+
+            // Load hooks from connection_profile_hooks
+            let hooks_repo = repo.hooks();
+            let hooks_dtos = hooks_repo.get_for_profile(profile_id).ok().unwrap_or_default();
+            let hooks = if hooks_dtos.is_empty() {
+                None
+            } else {
+                Some(load_connection_hooks_from_dtos(
+                    &hooks_dtos,
+                    &repo.hook_args(),
+                    &repo.hook_envs(),
+                ))
+            };
+
+            // Load hook bindings from connection_profile_hook_bindings
+            let bindings_repo = repo.hook_bindings();
+            let bindings = bindings_repo.get_for_profile(profile_id).ok().unwrap_or_default();
+            let hook_bindings = if bindings.is_empty() {
+                None
+            } else {
+                Some(load_hook_bindings_from_dtos(&bindings))
+            };
+
+            // Load mcp_governance from connection_profile_governance
+            let gov_repo = repo.governance();
+            let gov_enabled = gov_repo
+                .get_for_profile(profile_id)
+                .ok()
+                .and_then(|entries| {
+                    entries
+                        .into_iter()
+                        .find(|e| e.governance_key == "enabled")
+                        .and_then(|e| e.governance_value.and_then(|v| v.parse().ok()))
+                });
+            let gov_bindings_repo = repo.governance_bindings();
+            let gov_bindings = gov_bindings_repo.get_for_profile(profile_id).ok().unwrap_or_default();
+            let mcp_governance = if gov_enabled.is_some() || !gov_bindings.is_empty() {
+                let mut policy_bindings = Vec::new();
+                for binding in &gov_bindings {
+                    let roles_repo = repo.governance_binding_roles();
+                    let policies_repo = repo.governance_binding_policies();
+                    let role_ids = roles_repo
+                        .get_for_binding(&binding.id)
+                        .ok()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|r| r.role_id)
+                        .collect();
+                    let policy_ids = policies_repo
+                        .get_for_binding(&binding.id)
+                        .ok()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|p| p.policy_id)
+                        .collect();
+                    policy_bindings.push(ConnectionMcpPolicyBinding {
+                        actor_id: binding.actor_id.clone(),
+                        role_ids,
+                        policy_ids,
+                    });
+                }
+                Some(ConnectionMcpGovernance {
+                    enabled: gov_enabled.unwrap_or(false),
+                    policy_bindings,
+                })
+            } else {
+                None
+            };
+
+            Some(ConnectionProfile {
+                id,
+                name: dto.name,
+                kind: dto.kind.as_ref().and_then(|k| str_to_db_kind(k)),
+                driver_id: dto.driver_id,
+                config,
+                save_password: dto.save_password,
+                settings_overrides,
+                connection_settings,
+                hooks,
+                hook_bindings,
+                proxy_profile_id: dto.proxy_profile_id.as_ref().and_then(|s| uuid::Uuid::parse_str(s).ok()),
+                auth_profile_id: dto.auth_profile_id.as_ref().and_then(|s| uuid::Uuid::parse_str(s).ok()),
+                value_refs: value_refs_map,
+                access_kind,
+                mcp_governance,
+                read_only_flag: false,
+            })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Auth Profile helpers
+// ---------------------------------------------------------------------------
+
+fn load_auth_profiles(
+    repo: &dory_storage::repositories::auth_profiles::AuthProfileRepository,
+) -> Vec<dory_core::AuthProfile> {
+    if let Ok(entries) = repo.all() {
+        entries
+            .into_iter()
+            .filter_map(|dto| {
+                let fields = repo.get_fields(&dto.id).unwrap_or_default();
+                let id = uuid::Uuid::parse_str(&dto.id).ok()?;
+                Some(dory_core::AuthProfile {
+                    id,
+                    name: dto.name,
+                    provider_id: dto.provider_id,
+                    fields,
+                    // Re-hydrated from the keyring by AppState after load, where
+                    // the auth-provider registry is available to identify which
+                    // fields are secret-kind.
+                    secret_fields: std::collections::HashMap::new(),
+                    enabled: dto.enabled,
+                    read_only: false,
+                    dangling_origin: dto.dangling_origin,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proxy Profile helpers
+// ---------------------------------------------------------------------------
+
+fn load_proxy_profiles(
+    repo: &dory_storage::repositories::proxy_profiles::ProxyProfileRepository,
+    auth_repo: &dory_storage::repositories::proxy_auth::ProxyAuthRepository,
+) -> Vec<ProxyProfile> {
+    if let Ok(entries) = repo.all() {
+        entries
+            .into_iter()
+            .filter_map(|dto| {
+                let id = uuid::Uuid::parse_str(&dto.id).ok()?;
+                let auth = match dto.auth_kind.as_str() {
+                    "basic" => {
+                        if let Ok(Some(auth_dto)) = auth_repo.get(&dto.id) {
+                            dory_core::ProxyAuth::Basic {
+                                username: auth_dto.username.unwrap_or_default(),
+                            }
+                        } else {
+                            dory_core::ProxyAuth::None
+                        }
+                    }
+                    _ => dory_core::ProxyAuth::None,
+                };
+                let kind = match dto.kind.to_lowercase().as_str() {
+                    "http" => dory_core::ProxyKind::Http,
+                    "https" => dory_core::ProxyKind::Https,
+                    "socks5" | "socks" => dory_core::ProxyKind::Socks5,
+                    _ => dory_core::ProxyKind::Http,
+                };
+                Some(ProxyProfile {
+                    id,
+                    name: dto.name,
+                    kind,
+                    host: dto.host,
+                    port: dto.port as u16,
+                    auth,
+                    no_proxy: dto.no_proxy,
+                    enabled: dto.enabled,
+                    save_secret: dto.save_secret,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSH Tunnel helpers
+// ---------------------------------------------------------------------------
+
+fn load_ssh_tunnels(
+    repo: &dory_storage::repositories::ssh_tunnel_profiles::SshTunnelProfileRepository,
+) -> Vec<SshTunnelProfile> {
+    if let Ok(entries) = repo.all() {
+        entries
+            .into_iter()
+            .filter_map(|dto| {
+                let id = uuid::Uuid::parse_str(&dto.id).ok()?;
+                let auth_method = match dto.auth_method.as_str() {
+                    "key" => {
+                        if let Ok(Some(auth_dto)) = repo.get_auth(&dto.id) {
+                            dory_core::SshAuthMethod::PrivateKey {
+                                key_path: auth_dto.key_path.map(std::path::PathBuf::from),
+                            }
+                        } else {
+                            dory_core::SshAuthMethod::PrivateKey { key_path: None }
+                        }
+                    }
+                    _ => dory_core::SshAuthMethod::Password,
+                };
+                let config = dory_core::SshTunnelConfig {
+                    host: dto.host,
+                    port: dto.port as u16,
+                    user: dto.user,
+                    auth_method,
+                };
+                Some(SshTunnelProfile {
+                    id,
+                    name: dto.name,
+                    config,
+                    save_secret: dto.save_secret,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HookDefinitionSave, db_kind_to_str, default_db_config_for_kind, font_setting_from_storage,
+        font_setting_to_storage, load_config, save_hook_definitions, save_profiles, save_services,
+        save_ssh_tunnels, str_to_db_kind,
+    };
+    use dory_core::{
+        AccessKind, ConnectionHook, ConnectionHookBindings, ConnectionHooks, ConnectionProfile,
+        DbConfig, DbKind, GeneralSettings, HookExecutionMode, HookFailureMode, HookKind,
+        LuaCapabilities, RpcServiceKind, ScriptLanguage, ScriptSource, ServiceConfig,
+        SshAuthMethod, SshTunnelConfig, SshTunnelProfile, ThemeSetting,
+    };
+    use dory_storage::bootstrap::StorageRuntime;
+    use dory_storage::repositories::general_settings::GeneralSettingsDto;
+    use uuid::Uuid;
+
+    fn command_hook(command: &str) -> ConnectionHook {
+        ConnectionHook {
+            enabled: true,
+            kind: HookKind::Command {
+                command: command.to_string(),
+                args: vec!["--quiet".to_string()],
+            },
+            cwd: None,
+            env: [("MODE".to_string(), "test".to_string())].into(),
+            inherit_env: true,
+            env_denylist: vec![],
+            timeout_ms: Some(1_000),
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Warn,
+        }
+    }
+
+    #[test]
+    fn load_and_save_hook_definitions_preserve_loaded_and_generated_ids() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let existing = HookDefinitionSave {
+            id: None,
+            name: "existing".to_string(),
+            hook: command_hook("echo existing"),
+        };
+        let saved = save_hook_definitions(&runtime, &[existing], &[]).expect("save existing hook");
+        let existing_id = saved["existing"].id.clone().expect("generated existing ID");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+        assert_eq!(
+            loaded.hook_definitions["existing"].id.as_deref(),
+            Some(existing_id.as_str())
+        );
+
+        let new = HookDefinitionSave {
+            id: None,
+            name: "new".to_string(),
+            hook: command_hook("echo new"),
+        };
+        let existing = HookDefinitionSave {
+            id: Some(existing_id.clone()),
+            name: "existing".to_string(),
+            hook: command_hook("echo existing"),
+        };
+        let saved = save_hook_definitions(&runtime, &[existing, new], &[]).expect("save new hook");
+        assert!(saved["new"].id.is_some());
+        assert_ne!(saved["new"].id, saved["existing"].id);
+    }
+
+    #[test]
+    fn global_hook_kinds_and_shared_fields_round_trip_losslessly() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let shared = |kind| ConnectionHook {
+            enabled: false,
+            kind,
+            cwd: Some("/tmp/global-hooks".into()),
+            env: [("GLOBAL_ENV".to_string(), "value".to_string())].into(),
+            inherit_env: false,
+            env_denylist: vec!["GLOBAL_SECRET".to_string()],
+            timeout_ms: Some(3_000),
+            execution_mode: HookExecutionMode::Detached,
+            ready_signal: Some("global-ready".to_string()),
+            on_failure: HookFailureMode::Ignore,
+        };
+        let definitions = vec![
+            HookDefinitionSave {
+                id: None,
+                name: "command".to_string(),
+                hook: shared(HookKind::Command {
+                    command: "global-command".to_string(),
+                    args: vec!["--global".to_string()],
+                }),
+            },
+            HookDefinitionSave {
+                id: None,
+                name: "script".to_string(),
+                hook: shared(HookKind::Script {
+                    language: ScriptLanguage::Python,
+                    source: ScriptSource::File {
+                        path: "/tmp/global.py".into(),
+                    },
+                    interpreter: Some("python3.12".to_string()),
+                }),
+            },
+            HookDefinitionSave {
+                id: None,
+                name: "lua".to_string(),
+                hook: shared(HookKind::Lua {
+                    source: ScriptSource::Inline {
+                        content: "print('global lua')".to_string(),
+                    },
+                    capabilities: LuaCapabilities {
+                        logging: false,
+                        env_read: true,
+                        connection_metadata: false,
+                        process_run: true,
+                    },
+                }),
+            },
+        ];
+
+        let saved = save_hook_definitions(&runtime, &definitions, &[])
+            .expect("save global hook definitions");
+        let loaded = load_config(&runtime).expect("load configuration");
+
+        for definition in definitions {
+            let persisted = loaded
+                .hook_definitions
+                .get(&definition.name)
+                .expect("reloaded global hook");
+            assert_eq!(persisted.hook, definition.hook);
+            assert_eq!(persisted.id, saved[&definition.name].id);
+        }
+    }
+
+    #[test]
+    fn global_and_profile_hooks_preserve_empty_and_omitted_values() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let empty_hook = ConnectionHook {
+            enabled: true,
+            kind: HookKind::Command {
+                command: "echo empty".to_string(),
+                args: Vec::new(),
+            },
+            cwd: None,
+            env: Default::default(),
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            timeout_ms: None,
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Warn,
+        };
+        let defaulted_hook = ConnectionHook {
+            timeout_ms: Some(0),
+            ready_signal: Some(String::new()),
+            ..empty_hook.clone()
+        };
+
+        save_hook_definitions(
+            &runtime,
+            &[
+                HookDefinitionSave {
+                    id: None,
+                    name: "empty-global".to_string(),
+                    hook: empty_hook.clone(),
+                },
+                HookDefinitionSave {
+                    id: None,
+                    name: "defaulted-global".to_string(),
+                    hook: defaulted_hook.clone(),
+                },
+            ],
+            &[],
+        )
+        .expect("save global hooks");
+
+        let mut profile = ConnectionProfile::new("empty-profile", DbConfig::default_postgres());
+        profile.hooks = Some(ConnectionHooks {
+            pre_connect: vec![empty_hook.clone()],
+            post_connect: vec![defaulted_hook.clone()],
+            pre_disconnect: Vec::new(),
+            post_disconnect: Vec::new(),
+        });
+        save_profiles(&runtime, &[profile.clone()]).expect("save profile hooks");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+        assert_eq!(loaded.hook_definitions["empty-global"].hook, empty_hook);
+        assert_eq!(
+            loaded.hook_definitions["defaulted-global"].hook,
+            defaulted_hook
+        );
+
+        let loaded_profile = loaded
+            .profiles
+            .into_iter()
+            .find(|candidate| candidate.id == profile.id)
+            .expect("load profile");
+        assert_eq!(loaded_profile.hooks, profile.hooks);
+    }
+
+    #[test]
+    fn load_config_protects_malformed_canonical_rows_without_mutating_them() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let saved = save_hook_definitions(
+            &runtime,
+            &[HookDefinitionSave {
+                id: None,
+                name: "broken".to_string(),
+                hook: command_hook("echo broken"),
+            }],
+            &[],
+        )
+        .expect("save hook");
+        let row_id = saved["broken"].id.clone().expect("generated ID");
+
+        let repo = runtime.hook_definitions();
+        let mut dto = repo.get(&row_id).expect("load row").expect("saved row");
+        dto.kind_json = Some("{not valid json".to_string());
+        repo.update(&dto).expect("corrupt canonical payload");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+
+        assert!(!loaded.hook_definitions.contains_key("broken"));
+        assert_eq!(loaded.protected_hook_rows.len(), 1);
+        assert_eq!(loaded.protected_hook_rows[0].row_id, row_id);
+        assert_eq!(
+            loaded.protected_hook_rows[0].row_name.as_deref(),
+            Some("broken")
+        );
+        assert_eq!(loaded.hook_load_diagnostics.len(), 1);
+        assert_eq!(
+            runtime
+                .hook_definitions()
+                .get(&row_id)
+                .expect("load row")
+                .expect("row")
+                .kind_json,
+            Some("{not valid json".to_string())
+        );
+    }
+
+    #[test]
+    fn load_config_recovers_unambiguous_legacy_command_without_diagnostic() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let dto = dory_storage::repositories::hook_definitions::HookDefinitionDto {
+            id: "legacy-command".to_string(),
+            name: "legacy".to_string(),
+            execution_mode: "Detached".to_string(),
+            script_ref: Some("echo legacy".to_string()),
+            cwd: None,
+            inherit_env: true,
+            timeout_ms: None,
+            ready_signal: None,
+            on_failure: "Ignore".to_string(),
+            enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+            env_denylist: Vec::new(),
+            kind_json: None,
+        };
+        runtime
+            .hook_definitions()
+            .upsert(&dto)
+            .expect("insert legacy command row");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+        let recovered = loaded
+            .hook_definitions
+            .get("legacy")
+            .expect("recover legacy command");
+
+        assert_eq!(recovered.id.as_deref(), Some("legacy-command"));
+        assert_eq!(
+            recovered.hook.kind,
+            HookKind::Command {
+                command: "echo legacy".to_string(),
+                args: Vec::new(),
+            }
+        );
+        assert_eq!(recovered.hook.execution_mode, HookExecutionMode::Detached);
+        assert_eq!(recovered.hook.on_failure, HookFailureMode::Ignore);
+        assert!(loaded.hook_load_diagnostics.is_empty());
+        assert!(loaded.protected_hook_rows.is_empty());
+    }
+
+    #[test]
+    fn load_config_protects_ambiguous_legacy_rows_deterministically() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let dto = dory_storage::repositories::hook_definitions::HookDefinitionDto {
+            id: "legacy-row".to_string(),
+            name: "legacy".to_string(),
+            execution_mode: "Blocking".to_string(),
+            script_ref: None,
+            cwd: None,
+            inherit_env: true,
+            timeout_ms: None,
+            ready_signal: None,
+            on_failure: "Warn".to_string(),
+            enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+            env_denylist: Vec::new(),
+            kind_json: None,
+        };
+        runtime
+            .hook_definitions()
+            .upsert(&dto)
+            .expect("insert legacy row");
+
+        let first = load_config(&runtime).expect("first load");
+        let second = load_config(&runtime).expect("second load");
+
+        assert!(!first.hook_definitions.contains_key("legacy"));
+        assert_eq!(first.protected_hook_rows, second.protected_hook_rows);
+        assert_eq!(first.hook_load_diagnostics, second.hook_load_diagnostics);
+        assert_eq!(first.protected_hook_rows[0].row_id, "legacy-row");
+    }
+
+    #[test]
+    fn save_hook_definitions_renames_by_id_and_keeps_identity() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let saved = save_hook_definitions(
+            &runtime,
+            &[HookDefinitionSave {
+                id: None,
+                name: "before".to_string(),
+                hook: command_hook("echo before"),
+            }],
+            &[],
+        )
+        .expect("save original hook");
+        let id = saved["before"].id.clone();
+
+        let saved = save_hook_definitions(
+            &runtime,
+            &[HookDefinitionSave {
+                id: id.clone(),
+                name: "after".to_string(),
+                hook: command_hook("echo after"),
+            }],
+            &[],
+        )
+        .expect("rename hook");
+
+        assert_eq!(saved["after"].id, id);
+        assert!(
+            runtime
+                .hook_definitions()
+                .all()
+                .expect("load rows")
+                .iter()
+                .all(|row| row.name != "before")
+        );
+    }
+
+    #[test]
+    fn profile_hook_kinds_and_shared_fields_round_trip_losslessly() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let mut profile = ConnectionProfile::new("hooked", DbConfig::default_postgres());
+        let shared = |kind| ConnectionHook {
+            enabled: false,
+            kind,
+            cwd: Some("/tmp/hooks".into()),
+            env: [("HOOK_ENV".to_string(), "value".to_string())].into(),
+            inherit_env: false,
+            env_denylist: vec!["SECRET_TOKEN".to_string()],
+            timeout_ms: Some(2_000),
+            execution_mode: HookExecutionMode::Detached,
+            ready_signal: Some("ready".to_string()),
+            on_failure: HookFailureMode::Ignore,
+        };
+        profile.hooks = Some(ConnectionHooks {
+            pre_connect: vec![shared(HookKind::Command {
+                command: "command".to_string(),
+                args: vec!["--flag".to_string(), "value".to_string()],
+            })],
+            post_connect: vec![shared(HookKind::Script {
+                language: ScriptLanguage::Python,
+                source: ScriptSource::Inline {
+                    content: "print('inline')".to_string(),
+                },
+                interpreter: Some("python3.12".to_string()),
+            })],
+            pre_disconnect: vec![shared(HookKind::Script {
+                language: ScriptLanguage::Bash,
+                source: ScriptSource::File {
+                    path: "/tmp/hook.sh".into(),
+                },
+                interpreter: Some("bash".to_string()),
+            })],
+            post_disconnect: vec![
+                shared(HookKind::Lua {
+                    source: ScriptSource::Inline {
+                        content: "print('lua inline')".to_string(),
+                    },
+                    capabilities: LuaCapabilities {
+                        logging: false,
+                        env_read: true,
+                        connection_metadata: false,
+                        process_run: true,
+                    },
+                }),
+                shared(HookKind::Lua {
+                    source: ScriptSource::File {
+                        path: "/tmp/hook.lua".into(),
+                    },
+                    capabilities: LuaCapabilities::all_enabled(),
+                }),
+            ],
+        });
+
+        save_profiles(&runtime, &[profile.clone()]).expect("save profile hooks");
+        let loaded = load_config(&runtime)
+            .expect("load configuration")
+            .profiles
+            .into_iter()
+            .find(|candidate| candidate.id == profile.id)
+            .expect("reloaded profile");
+
+        assert_eq!(loaded.hooks, profile.hooks);
+    }
+
+    #[test]
+    fn profile_hook_binding_references_definition_id_and_round_trips() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+
+        let saved = save_hook_definitions(
+            &runtime,
+            &[HookDefinitionSave {
+                id: None,
+                name: "seed-db".to_string(),
+                hook: command_hook("echo seed"),
+            }],
+            &[],
+        )
+        .expect("save hook definition");
+        let definition_id = saved["seed-db"]
+            .id
+            .clone()
+            .expect("generated definition id");
+
+        let mut profile = ConnectionProfile::new("bound", DbConfig::default_postgres());
+        profile.hook_bindings = Some(ConnectionHookBindings {
+            pre_connect: vec![definition_id.clone()],
+            post_connect: Vec::new(),
+            pre_disconnect: Vec::new(),
+            post_disconnect: Vec::new(),
+        });
+
+        save_profiles(&runtime, &[profile.clone()]).expect("save profile with hook binding");
+
+        let loaded = load_config(&runtime)
+            .expect("load configuration")
+            .profiles
+            .into_iter()
+            .find(|candidate| candidate.id == profile.id)
+            .expect("reloaded profile");
+
+        let bindings = loaded
+            .hook_bindings
+            .expect("hook bindings must survive reload");
+
+        assert_eq!(bindings.pre_connect, vec![definition_id]);
+        assert!(bindings.post_connect.is_empty());
+        assert!(bindings.pre_disconnect.is_empty());
+        assert!(bindings.post_disconnect.is_empty());
+    }
+
+    #[test]
+    fn profile_hook_with_empty_command_round_trips_as_command_not_dropped() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let mut profile = ConnectionProfile::new("empty-command", DbConfig::default_postgres());
+
+        let empty_command_hook = ConnectionHook {
+            enabled: true,
+            kind: HookKind::Command {
+                command: String::new(),
+                args: Vec::new(),
+            },
+            cwd: None,
+            env: std::collections::HashMap::new(),
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            timeout_ms: None,
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Disconnect,
+        };
+
+        profile.hooks = Some(ConnectionHooks {
+            pre_connect: vec![empty_command_hook.clone()],
+            post_connect: Vec::new(),
+            pre_disconnect: Vec::new(),
+            post_disconnect: Vec::new(),
+        });
+
+        save_profiles(&runtime, &[profile.clone()]).expect("save profile hooks");
+        let loaded = load_config(&runtime)
+            .expect("load configuration")
+            .profiles
+            .into_iter()
+            .find(|candidate| candidate.id == profile.id)
+            .expect("reloaded profile");
+
+        let reloaded_hook = loaded
+            .hooks
+            .as_ref()
+            .and_then(|hooks| hooks.pre_connect.first())
+            .expect("empty-command hook must survive reload");
+
+        assert_eq!(reloaded_hook.kind, empty_command_hook.kind);
+        assert!(matches!(
+            reloaded_hook.kind,
+            HookKind::Command { ref command, .. } if command.is_empty()
+        ));
+    }
+
+    #[test]
+    fn default_db_config_for_kind_maps_mariadb_to_mysql_config() {
+        assert!(matches!(
+            default_db_config_for_kind(DbKind::MariaDB),
+            DbConfig::MySQL { .. }
+        ));
+        assert!(matches!(
+            default_db_config_for_kind(DbKind::MySQL),
+            DbConfig::MySQL { .. }
+        ));
+    }
+
+    #[test]
+    fn default_db_config_for_kind_maps_influxdb_to_influx_config() {
+        assert!(matches!(
+            default_db_config_for_kind(DbKind::InfluxDB),
+            DbConfig::InfluxDB { .. }
+        ));
+    }
+
+    #[test]
+    fn clickhouse_kind_and_default_config_use_canonical_storage_name() {
+        assert_eq!(db_kind_to_str(DbKind::ClickHouse), "ClickHouse");
+        assert_eq!(str_to_db_kind("ClickHouse"), Some(DbKind::ClickHouse));
+        assert!(matches!(
+            default_db_config_for_kind(DbKind::ClickHouse),
+            DbConfig::ClickHouse {
+                ref url,
+                ref user,
+                ref database,
+                request_timeout_seconds: None,
+            } if url == "http://localhost:8123" && user == "default" && database == "default"
+        ));
+    }
+
+    #[test]
+    fn theme_setting_storage_round_trip_supports_all_theme_values() {
+        for (theme, storage) in [
+            (ThemeSetting::DoryDark, "dory_dark"),
+            (ThemeSetting::DoryLight, "dory_light"),
+            (ThemeSetting::Dark, "dark"),
+            (ThemeSetting::Mirage, "mirage"),
+            (ThemeSetting::Light, "light"),
+            (ThemeSetting::Nord, "nord"),
+            (ThemeSetting::Dracula, "dracula"),
+            (ThemeSetting::CatppuccinLatte, "catppuccin_latte"),
+            (ThemeSetting::GitHubLight, "github_light"),
+            (ThemeSetting::OneLight, "one_light"),
+        ] {
+            assert_eq!(theme.as_storage_str(), storage);
+            assert_eq!(ThemeSetting::from_storage_str(storage), theme);
+        }
+    }
+
+    #[test]
+    fn invalid_theme_storage_value_falls_back_to_dory_dark_without_touching_other_settings() {
+        let dto = GeneralSettingsDto {
+            id: 1,
+            theme: "twilight".to_string(),
+            restore_session_on_startup: 0,
+            reopen_last_connections: 1,
+            default_focus_on_startup: "last_tab".to_string(),
+            max_history_entries: 222,
+            auto_save_interval_ms: 999,
+            default_refresh_policy: "interval".to_string(),
+            default_refresh_interval_secs: 15,
+            max_concurrent_background_tasks: 4,
+            auto_refresh_pause_on_error: 0,
+            auto_refresh_only_if_visible: 1,
+            confirm_dangerous_queries: 0,
+            dangerous_requires_where: 0,
+            dangerous_requires_preview: 1,
+            style: "default".to_string(),
+            schema_snapshot_retention: 10,
+            object_preview_size_limit_mib: 10,
+            language: String::new(),
+            ui_font: String::new(),
+            theme_mode: "system".to_string(),
+            dark_theme: "dory_dark".to_string(),
+            light_theme: "dory_light".to_string(),
+            updated_at: String::new(),
+        };
+
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        runtime
+            .general_settings()
+            .upsert(&dto)
+            .expect("save general settings dto");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+
+        assert_eq!(loaded.general_settings.theme, ThemeSetting::DoryDark);
+        assert!(!loaded.general_settings.restore_session_on_startup);
+        assert!(loaded.general_settings.reopen_last_connections);
+        assert_eq!(
+            loaded.general_settings.default_focus_on_startup,
+            dory_core::StartupFocus::LastTab
+        );
+        assert_eq!(loaded.general_settings.max_history_entries, 222);
+        assert_eq!(loaded.general_settings.auto_save_interval_ms, 999);
+        assert_eq!(
+            loaded.general_settings.default_refresh_policy,
+            dory_core::RefreshPolicySetting::Interval
+        );
+        assert_eq!(loaded.general_settings.default_refresh_interval_secs, 15);
+        assert_eq!(loaded.general_settings.max_concurrent_background_tasks, 4);
+        assert!(!loaded.general_settings.auto_refresh_pause_on_error);
+        assert!(loaded.general_settings.auto_refresh_only_if_visible);
+        assert!(!loaded.general_settings.confirm_dangerous_queries);
+        assert!(!loaded.general_settings.dangerous_requires_where);
+        assert!(loaded.general_settings.dangerous_requires_preview);
+    }
+
+    fn shipped_locale_ids() -> Vec<String> {
+        let locales_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dory_i18n/locales");
+        let entries = std::fs::read_dir(&locales_dir).unwrap_or_else(|error| {
+            panic!(
+                "failed to read shipped locales from {}: {error}",
+                locales_dir.display()
+            )
+        });
+        let mut locale_ids = Vec::new();
+        for entry in entries {
+            let path = entry
+                .expect("locale directory entry must be readable")
+                .path();
+            if path.extension().and_then(std::ffi::OsStr::to_str) == Some("yml") {
+                locale_ids.push(
+                    path.file_stem()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .expect("locale filename must be valid UTF-8")
+                        .to_string(),
+                );
+            }
+        }
+        locale_ids.sort();
+        locale_ids
+    }
+
+    #[test]
+    fn unrecognized_language_storage_value_survives_load_and_save_unchanged() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+
+        let dto = GeneralSettingsDto {
+            id: 1,
+            theme: "dark".to_string(),
+            restore_session_on_startup: 1,
+            reopen_last_connections: 0,
+            default_focus_on_startup: "sidebar".to_string(),
+            max_history_entries: 1000,
+            auto_save_interval_ms: 2000,
+            default_refresh_policy: "manual".to_string(),
+            default_refresh_interval_secs: 5,
+            max_concurrent_background_tasks: 8,
+            auto_refresh_pause_on_error: 1,
+            auto_refresh_only_if_visible: 0,
+            confirm_dangerous_queries: 1,
+            dangerous_requires_where: 1,
+            dangerous_requires_preview: 0,
+            style: "default".to_string(),
+            schema_snapshot_retention: 10,
+            object_preview_size_limit_mib: 10,
+            language: "de".to_string(),
+            ui_font: String::new(),
+            theme_mode: "system".to_string(),
+            dark_theme: "dory_dark".to_string(),
+            light_theme: "dory_light".to_string(),
+            updated_at: String::new(),
+        };
+        runtime
+            .general_settings()
+            .upsert(&dto)
+            .expect("save general settings dto");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+        assert_eq!(
+            loaded.general_settings.language, "de",
+            "an unrecognized language code must survive the load; dory_i18n::resolve \
+             degrades it to System without erasing the stored choice"
+        );
+
+        super::save_general_settings(&runtime, &loaded.general_settings)
+            .expect("save loaded general settings");
+        let saved = runtime
+            .general_settings()
+            .get()
+            .expect("load re-saved dto")
+            .expect("general settings row");
+        assert_eq!(saved.language, "de");
+    }
+
+    #[test]
+    fn every_shipped_language_round_trips_through_save_and_load() {
+        let locale_ids = shipped_locale_ids();
+        assert!(!locale_ids.is_empty(), "at least one locale must ship");
+
+        for locale_id in locale_ids {
+            let settings = GeneralSettings {
+                language: locale_id.clone(),
+                ..Default::default()
+            };
+            let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+            super::save_general_settings(&runtime, &settings).expect("save general settings");
+
+            let dto = runtime
+                .general_settings()
+                .get()
+                .expect("load saved dto")
+                .expect("general settings row");
+            assert_eq!(dto.language, locale_id);
+
+            let loaded = load_config(&runtime).expect("load configuration");
+            assert_eq!(loaded.general_settings.language, locale_id);
+        }
+    }
+
+    #[test]
+    fn save_general_settings_persists_mirage_without_mutating_fonts_or_other_fields() {
+        let settings = GeneralSettings {
+            theme: ThemeSetting::Mirage,
+            max_history_entries: 77,
+            auto_save_interval_ms: 1234,
+            ..Default::default()
+        };
+
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+
+        super::save_general_settings(&runtime, &settings).expect("save general settings");
+
+        let dto = runtime
+            .general_settings()
+            .get()
+            .expect("load saved dto")
+            .expect("general settings row");
+
+        assert_eq!(dto.theme, "mirage");
+        assert_eq!(dto.max_history_entries, 77);
+        assert_eq!(dto.auto_save_interval_ms, 1234);
+    }
+
+    #[test]
+    fn save_general_settings_persists_theme_mode_and_polarity_picks() {
+        use dory_core::ThemeModeSetting;
+
+        let settings = GeneralSettings {
+            theme_mode: ThemeModeSetting::Dark,
+            dark_theme: ThemeSetting::Nord,
+            light_theme: ThemeSetting::GitHubLight,
+            ..Default::default()
+        };
+
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        super::save_general_settings(&runtime, &settings).expect("save general settings");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+        assert_eq!(loaded.general_settings.theme_mode, ThemeModeSetting::Dark);
+        assert_eq!(loaded.general_settings.dark_theme, ThemeSetting::Nord);
+        assert_eq!(
+            loaded.general_settings.light_theme,
+            ThemeSetting::GitHubLight
+        );
+    }
+
+    #[test]
+    fn app_style_round_trips_through_save_and_load() {
+        use dory_core::AppStyle;
+
+        // Compact round-trip
+        let mut settings = GeneralSettings {
+            style: AppStyle::Compact,
+            ..Default::default()
+        };
+
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        super::save_general_settings(&runtime, &settings).expect("save compact style");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+        assert_eq!(
+            loaded.general_settings.style,
+            AppStyle::Compact,
+            "compact style should survive save/load"
+        );
+
+        // Default round-trip
+        settings.style = AppStyle::Default;
+        super::save_general_settings(&runtime, &settings).expect("save default style");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+        assert_eq!(
+            loaded.general_settings.style,
+            AppStyle::Default,
+            "default style should survive save/load"
+        );
+    }
+
+    #[test]
+    fn unknown_style_string_in_db_falls_back_to_default() {
+        use dory_core::AppStyle;
+
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+
+        // Directly write an unknown style value into the DB.
+        let dto = GeneralSettingsDto {
+            id: 1,
+            theme: "dark".to_string(),
+            restore_session_on_startup: 1,
+            reopen_last_connections: 0,
+            default_focus_on_startup: "sidebar".to_string(),
+            max_history_entries: 1000,
+            auto_save_interval_ms: 2000,
+            default_refresh_policy: "manual".to_string(),
+            default_refresh_interval_secs: 5,
+            max_concurrent_background_tasks: 8,
+            auto_refresh_pause_on_error: 1,
+            auto_refresh_only_if_visible: 0,
+            confirm_dangerous_queries: 1,
+            dangerous_requires_where: 1,
+            dangerous_requires_preview: 0,
+            style: "ultracompact".to_string(), // unknown value
+            schema_snapshot_retention: 10,
+            object_preview_size_limit_mib: 10,
+            language: String::new(),
+            ui_font: String::new(),
+            theme_mode: "system".to_string(),
+            dark_theme: "dory_dark".to_string(),
+            light_theme: "dory_light".to_string(),
+            updated_at: String::new(),
+        };
+        runtime
+            .general_settings()
+            .upsert(&dto)
+            .expect("upsert with unknown style");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+        assert_eq!(
+            loaded.general_settings.style,
+            AppStyle::Default,
+            "unknown style string should fall back to Default"
+        );
+    }
+
+    #[test]
+    fn font_setting_storage_round_trip_supports_all_values() {
+        for (font, storage) in [
+            (dory_core::FontSetting::system(), ""),
+            (dory_core::FontSetting::named("Inter"), "Inter"),
+        ] {
+            assert_eq!(font_setting_to_storage(&font), storage);
+            assert_eq!(font_setting_from_storage(storage), font);
+        }
+        assert_eq!(
+            font_setting_from_storage("jetbrains_mono"),
+            dory_core::FontSetting::system(),
+            "legacy jetbrains_mono sentinel maps to the system UI font"
+        );
+        assert_eq!(
+            font_setting_from_storage("system"),
+            dory_core::FontSetting::system()
+        );
+        assert_eq!(
+            font_setting_from_storage("SauceCodePro Nerd Font"),
+            dory_core::FontSetting::system(),
+            "Nerd Fonts are not valid UI fonts and must load as system"
+        );
+    }
+
+    #[test]
+    fn system_font_storage_value_survives_load_and_save() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+
+        let dto = GeneralSettingsDto {
+            id: 1,
+            theme: "dark".to_string(),
+            restore_session_on_startup: 1,
+            reopen_last_connections: 0,
+            default_focus_on_startup: "sidebar".to_string(),
+            max_history_entries: 1000,
+            auto_save_interval_ms: 2000,
+            default_refresh_policy: "manual".to_string(),
+            default_refresh_interval_secs: 5,
+            max_concurrent_background_tasks: 8,
+            auto_refresh_pause_on_error: 1,
+            auto_refresh_only_if_visible: 0,
+            confirm_dangerous_queries: 1,
+            dangerous_requires_where: 1,
+            dangerous_requires_preview: 0,
+            style: "default".to_string(),
+            schema_snapshot_retention: 10,
+            object_preview_size_limit_mib: 10,
+            language: String::new(),
+            ui_font: String::new(), // system font
+            theme_mode: "system".to_string(),
+            dark_theme: "dory_dark".to_string(),
+            light_theme: "dory_light".to_string(),
+            updated_at: String::new(),
+        };
+        runtime
+            .general_settings()
+            .upsert(&dto)
+            .expect("upsert with system ui_font");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+        assert!(
+            loaded.general_settings.ui_font.is_system(),
+            "empty ui_font should mean system font"
+        );
+
+        super::save_general_settings(&runtime, &loaded.general_settings)
+            .expect("save loaded general settings");
+        let saved = runtime
+            .general_settings()
+            .get()
+            .expect("load re-saved dto")
+            .expect("general settings row");
+        assert_eq!(saved.ui_font, "");
+    }
+
+    #[test]
+    fn save_and_reload_preserves_ssh_tunnel_profile_reference() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+
+        let ssh_tunnel = SshTunnelProfile {
+            id: Uuid::new_v4(),
+            name: "bastion".to_string(),
+            config: SshTunnelConfig {
+                host: "bastion.example.com".to_string(),
+                port: 22,
+                user: "deploy".to_string(),
+                auth_method: SshAuthMethod::PrivateKey {
+                    key_path: Some("/tmp/bastion-key".into()),
+                },
+            },
+            save_secret: false,
+        };
+
+        save_ssh_tunnels(&runtime, std::slice::from_ref(&ssh_tunnel))
+            .expect("save ssh tunnel profile");
+
+        let mut profile = ConnectionProfile::new("pg-with-ssh", DbConfig::default_postgres());
+        profile.access_kind = Some(AccessKind::Ssh {
+            ssh_tunnel_profile_id: ssh_tunnel.id,
+        });
+
+        if let DbConfig::Postgres {
+            ssh_tunnel: inline_ssh_tunnel,
+            ssh_tunnel_profile_id,
+            ..
+        } = &mut profile.config
+        {
+            *inline_ssh_tunnel = None;
+            *ssh_tunnel_profile_id = Some(ssh_tunnel.id);
+        }
+
+        save_profiles(&runtime, &[profile.clone()]).expect("save connection profile");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+        let reloaded = loaded
+            .profiles
+            .into_iter()
+            .find(|candidate| candidate.id == profile.id)
+            .expect("reloaded profile");
+
+        match reloaded.access_kind {
+            Some(AccessKind::Ssh {
+                ssh_tunnel_profile_id,
+            }) => assert_eq!(ssh_tunnel_profile_id, ssh_tunnel.id),
+            other => panic!("expected ssh access kind, got {:?}", other),
+        }
+
+        match reloaded.config {
+            DbConfig::Postgres {
+                ssh_tunnel,
+                ssh_tunnel_profile_id,
+                ..
+            } => {
+                assert!(
+                    ssh_tunnel.is_none(),
+                    "saved tunnel profiles must not reload as inline SSH fields"
+                );
+                assert!(
+                    ssh_tunnel_profile_id.is_none(),
+                    "driver config storage should stay empty when the connection references a saved SSH tunnel profile"
+                );
+            }
+            other => panic!("expected postgres config, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_config_defaults_legacy_service_rows_to_driver_kind() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let conn = runtime.open_dory_db().expect("open runtime database");
+
+        conn.execute(
+            "INSERT INTO cfg_services (socket_id, enabled, command, startup_timeout_ms) VALUES (?1, ?2, ?3, ?4)",
+            [
+                "legacy-socket",
+                "1",
+                "dory-driver-host",
+                "5000",
+            ],
+        )
+            .expect("insert legacy service row");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+
+        assert_eq!(loaded.services.len(), 1);
+        assert_eq!(loaded.services[0].socket_id, "legacy-socket");
+        assert_eq!(loaded.services[0].kind, RpcServiceKind::Driver);
+    }
+
+    #[test]
+    fn save_services_persists_service_kind_for_roundtrip() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let services = vec![ServiceConfig {
+            socket_id: "auth-socket".to_string(),
+            enabled: true,
+            command: Some("dory-driver-host".to_string()),
+            args: vec!["--stdio".to_string()],
+            env: std::collections::HashMap::new(),
+            startup_timeout_ms: Some(5_000),
+            kind: RpcServiceKind::AuthProvider,
+            api_contract: Some(dory_core::ServiceRpcApiContract::new(
+                "auth_provider_rpc",
+                1,
+                0,
+            )),
+        }];
+
+        save_services(&runtime, &services).expect("save services");
+
+        let dto = runtime
+            .services()
+            .get("auth-socket")
+            .expect("load service dto")
+            .expect("service row");
+
+        assert_eq!(dto.service_kind, "auth_provider");
+        assert_eq!(dto.api_family.as_deref(), Some("auth_provider_rpc"));
+        assert_eq!(dto.api_major, Some(1));
+        assert_eq!(dto.api_minor, Some(0));
+
+        let loaded = load_config(&runtime).expect("load configuration");
+        assert_eq!(loaded.services.len(), 1);
+        assert_eq!(loaded.services[0].kind, RpcServiceKind::AuthProvider);
+        assert_eq!(
+            loaded.services[0].resolved_api_contract(),
+            dory_core::ServiceRpcApiContract::new("auth_provider_rpc", 1, 0)
+        );
+    }
+
+    #[test]
+    fn load_config_defaults_unknown_service_kind_to_driver() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let conn = runtime.open_dory_db().expect("open runtime database");
+
+        conn.execute(
+            "INSERT INTO cfg_services (socket_id, enabled, command, startup_timeout_ms, service_kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+            [
+                "unknown-socket",
+                "1",
+                "dory-driver-host",
+                "5000",
+                "mystery_kind",
+            ],
+        )
+        .expect("insert unknown-kind service row");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+
+        assert_eq!(loaded.services.len(), 1);
+        assert_eq!(loaded.services[0].kind, RpcServiceKind::Driver);
+    }
+
+    #[test]
+    fn load_config_defaults_missing_api_contract_to_driver_rpc_baseline() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let conn = runtime.open_dory_db().expect("open runtime database");
+
+        conn.execute(
+            "INSERT INTO cfg_services (socket_id, enabled, command, startup_timeout_ms, service_kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+            [
+                "driver-socket",
+                "1",
+                "dory-driver-host",
+                "5000",
+                "driver",
+            ],
+        )
+        .expect("insert driver service row");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+
+        assert_eq!(loaded.services.len(), 1);
+        assert_eq!(
+            loaded.services[0].resolved_api_contract(),
+            dory_core::ServiceRpcApiContract::new("driver_rpc", 1, 1)
+        );
+    }
+
+    #[test]
+    fn load_config_ignores_out_of_range_api_contract_versions() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+        let conn = runtime.open_dory_db().expect("open runtime database");
+
+        conn.execute(
+            &format!(
+                "INSERT INTO cfg_services (socket_id, enabled, command, startup_timeout_ms, service_kind, api_family, api_major, api_minor) VALUES ('driver-socket', 1, 'dory-driver-host', 5000, 'driver', 'driver_rpc', {}, -1)",
+                i64::from(u16::MAX) + 1,
+            ),
+            [],
+        )
+        .expect("insert malformed api contract row");
+
+        let loaded = load_config(&runtime).expect("load configuration");
+
+        assert_eq!(loaded.services.len(), 1);
+        assert_eq!(loaded.services[0].api_contract, None);
+        assert_eq!(
+            loaded.services[0].resolved_api_contract(),
+            dory_core::ServiceRpcApiContract::new("driver_rpc", 1, 1)
+        );
+    }
+}

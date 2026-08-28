@@ -1,0 +1,40 @@
+[package]
+name = "dory_ui_windows"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Connection manager and settings windows for Dory"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+dory_ui_base.workspace = true
+dory_components.workspace = true
+dory_core.workspace = true
+dory_app.workspace = true
+dory_storage.workspace = true
+dory_portability.workspace = true
+dory_ssh.workspace = true
+dory_i18n.workspace = true
+dory_mcp = { workspace = true, optional = true }
+dory_policy = { workspace = true, optional = true }
+uuid.workspace = true
+log.workspace = true
+serde_json.workspace = true
+rfd.workspace = true
+dirs.workspace = true
+open = "5"
+
+[features]
+default = []
+mcp = ["dory_mcp", "dory_policy", "dory_app/mcp", "dory_ui_base/mcp"]
+# `lua` and `aws` are passthroughs: no windows code uses them directly, but they
+# must forward to dory_app/dory_ui_base so dory_app is not built twice with
+# mismatched feature sets across the workspace.
+lua = ["dory_app/lua", "dory_ui_base/lua"]
+aws = ["dory_app/aws", "dory_ui_base/aws"]

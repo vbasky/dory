@@ -1,0 +1,40 @@
+[package]
+name = "dory_ui_base"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "App-state-aware UI base layer for Dory (AppStateEntity + GPUI event types)"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+dory_app.workspace = true
+dory_storage.workspace = true
+dory_components.workspace = true
+dory_core.workspace = true
+dory_i18n.workspace = true
+dory_mcp = { workspace = true, optional = true }
+dory_aws = { workspace = true, optional = true }
+tracing.workspace = true
+uuid.workspace = true
+log.workspace = true
+anyhow = { workspace = true }
+chrono.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+tempfile = "3"
+rusqlite.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+mcp = ["dory_mcp", "dory_app/mcp"]
+lua = ["dory_app/lua"]
+aws = ["dory_aws", "dory_app/aws"]

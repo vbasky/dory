@@ -1,0 +1,18 @@
+[package]
+name = "custom_auth_provider_example"
+version = "0.1.0"
+edition = "2024"
+
+# This example is standalone, not part of the workspace
+[workspace]
+
+[[bin]]
+name = "custom-auth-provider"
+path = "src/main.rs"
+
+[dependencies]
+dory_core = { path = "../../crates/dory_core" }
+dory_ipc = { path = "../../crates/dory_ipc" }
+interprocess = "2.4"
+log = "0.4"
+env_logger = "0.11"

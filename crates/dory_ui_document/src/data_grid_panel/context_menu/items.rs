@@ -1,0 +1,197 @@
+use super::ContextMenuItem;
+use dory_components::components::data_table::ContextMenuAction;
+use dory_components::icons::AppIcon;
+
+pub(super) fn build_context_menu_items(
+    is_editable: bool,
+    is_document_view: bool,
+    has_row_target: bool,
+    can_chart: bool,
+    inspect_row_enabled: bool,
+) -> Vec<ContextMenuItem> {
+    if is_document_view {
+        let mut items = Vec::new();
+
+        if has_row_target {
+            items.extend([
+                ContextMenuItem {
+                    label: dory_i18n::t!("document.data.context_menu.item.copy").into(),
+                    action: Some(ContextMenuAction::Copy),
+                    icon: Some(AppIcon::Layers),
+                    is_separator: false,
+                    is_danger: false,
+                },
+                ContextMenuItem {
+                    label: dory_i18n::t!("document.data.context_menu.item.view_document").into(),
+                    action: Some(ContextMenuAction::EditInModal),
+                    icon: Some(AppIcon::Maximize2),
+                    is_separator: false,
+                    is_danger: false,
+                },
+            ]);
+        }
+
+        if is_editable {
+            if !items.is_empty() {
+                items.push(ContextMenuItem {
+                    label: "".into(),
+                    action: None,
+                    icon: None,
+                    is_separator: true,
+                    is_danger: false,
+                });
+            }
+
+            items.push(ContextMenuItem {
+                label: dory_i18n::t!("document.data.context_menu.item.add_document").into(),
+                action: Some(ContextMenuAction::AddRow),
+                icon: Some(AppIcon::Plus),
+                is_separator: false,
+                is_danger: false,
+            });
+
+            if has_row_target {
+                items.extend([
+                    ContextMenuItem {
+                        label: dory_i18n::t!("document.data.context_menu.item.duplicate_document")
+                            .into(),
+                        action: Some(ContextMenuAction::DuplicateRow),
+                        icon: Some(AppIcon::Layers),
+                        is_separator: false,
+                        is_danger: false,
+                    },
+                    ContextMenuItem {
+                        label: dory_i18n::t!("document.data.context_menu.item.delete_document")
+                            .into(),
+                        action: Some(ContextMenuAction::DeleteRow),
+                        icon: Some(AppIcon::Delete),
+                        is_separator: false,
+                        is_danger: true,
+                    },
+                ]);
+            }
+        }
+
+        return items;
+    }
+
+    let mut items = vec![ContextMenuItem {
+        label: dory_i18n::t!("document.data.context_menu.item.copy").into(),
+        action: Some(ContextMenuAction::Copy),
+        icon: Some(AppIcon::Layers),
+        is_separator: false,
+        is_danger: false,
+    }];
+
+    if is_editable {
+        if has_row_target {
+            items.extend([
+                ContextMenuItem {
+                    label: dory_i18n::t!("document.data.context_menu.item.paste").into(),
+                    action: Some(ContextMenuAction::Paste),
+                    icon: Some(AppIcon::Download),
+                    is_separator: false,
+                    is_danger: false,
+                },
+                ContextMenuItem {
+                    label: dory_i18n::t!("document.data.context_menu.item.edit").into(),
+                    action: Some(ContextMenuAction::Edit),
+                    icon: Some(AppIcon::Pencil),
+                    is_separator: false,
+                    is_danger: false,
+                },
+                ContextMenuItem {
+                    label: dory_i18n::t!("document.data.context_menu.item.edit_in_modal").into(),
+                    action: Some(ContextMenuAction::EditInModal),
+                    icon: Some(AppIcon::Maximize2),
+                    is_separator: false,
+                    is_danger: false,
+                },
+                ContextMenuItem {
+                    label: "".into(),
+                    action: None,
+                    icon: None,
+                    is_separator: true,
+                    is_danger: false,
+                },
+                ContextMenuItem {
+                    label: dory_i18n::t!("document.data.context_menu.item.set_default").into(),
+                    action: Some(ContextMenuAction::SetDefault),
+                    icon: Some(AppIcon::RotateCcw),
+                    is_separator: false,
+                    is_danger: false,
+                },
+                ContextMenuItem {
+                    label: dory_i18n::t!("document.data.context_menu.item.set_null").into(),
+                    action: Some(ContextMenuAction::SetNull),
+                    icon: Some(AppIcon::X),
+                    is_separator: false,
+                    is_danger: false,
+                },
+                ContextMenuItem {
+                    label: "".into(),
+                    action: None,
+                    icon: None,
+                    is_separator: true,
+                    is_danger: false,
+                },
+            ]);
+        }
+
+        items.push(ContextMenuItem {
+            label: dory_i18n::t!("document.data.context_menu.item.add_row").into(),
+            action: Some(ContextMenuAction::AddRow),
+            icon: Some(AppIcon::Plus),
+            is_separator: false,
+            is_danger: false,
+        });
+
+        if has_row_target {
+            if inspect_row_enabled {
+                items.push(ContextMenuItem {
+                    label: dory_i18n::t!("document.data.context_menu.item.inspect_row").into(),
+                    action: Some(ContextMenuAction::InspectRow),
+                    icon: Some(AppIcon::Info),
+                    is_separator: false,
+                    is_danger: false,
+                });
+            }
+
+            items.extend([
+                ContextMenuItem {
+                    label: dory_i18n::t!("document.data.context_menu.item.duplicate_row").into(),
+                    action: Some(ContextMenuAction::DuplicateRow),
+                    icon: Some(AppIcon::Layers),
+                    is_separator: false,
+                    is_danger: false,
+                },
+                ContextMenuItem {
+                    label: dory_i18n::t!("document.data.context_menu.item.delete_row").into(),
+                    action: Some(ContextMenuAction::DeleteRow),
+                    icon: Some(AppIcon::Delete),
+                    is_separator: false,
+                    is_danger: true,
+                },
+            ]);
+        }
+    }
+
+    if can_chart {
+        items.push(ContextMenuItem {
+            label: "".into(),
+            action: None,
+            icon: None,
+            is_separator: true,
+            is_danger: false,
+        });
+        items.push(ContextMenuItem {
+            label: dory_i18n::t!("document.data.context_menu.item.chart_this_query").into(),
+            action: Some(ContextMenuAction::ChartThisQuery),
+            icon: Some(AppIcon::ChartSpline),
+            is_separator: false,
+            is_danger: false,
+        });
+    }
+
+    items
+}

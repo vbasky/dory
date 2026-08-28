@@ -1,0 +1,17 @@
+target/
+.direnv
+thoughts/
+scripts/src
+scripts/pkg
+scripts/dory*
+.logs
+result
+.atl/
+# Local Pi runtime state
+.agent/
+.codegraph/
+dist/
+*.dmg
+*.dmg.sha256
+.DS_Store
+.commandcode/

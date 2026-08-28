@@ -1,0 +1,95 @@
+use std::fs;
+use std::path::PathBuf;
+
+fn read_workspace_file(relative_path: &str) -> String {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    fs::read_to_string(root.join(relative_path)).expect("file should be readable")
+}
+
+/// Reads every `.rs` file under a module directory and concatenates them.
+///
+/// Used for source-wiring assertions against modules that are split into a
+/// directory of sibling files, so the checks stay agnostic to which file a
+/// given symbol lives in.
+fn read_workspace_module(relative_dir: &str) -> String {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dir = root.join(relative_dir);
+
+    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
+        .expect("module directory should be readable")
+        .map(|entry| entry.expect("dir entry should be readable").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    entries.sort();
+
+    entries
+        .iter()
+        .map(|path| fs::read_to_string(path).expect("file should be readable"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn ui_contains_trusted_client_and_connection_policy_controls() {
+    let mcp_settings = read_workspace_file("../dory_ui_windows/src/settings/mcp_section.rs");
+    let connection_form = read_workspace_file("../dory_ui_windows/src/connection_manager/form.rs");
+    let connection_tabs =
+        read_workspace_file("../dory_ui_windows/src/connection_manager/render_tabs.rs");
+
+    assert!(mcp_settings.contains("mcp-client-save"));
+    assert!(mcp_settings.contains("mcp-client-toggle-active"));
+
+    assert!(connection_form.contains("save_mcp_connection_policy_assignment"));
+    assert!(connection_form.contains("ConnectionPolicyUpdated"));
+    assert!(connection_tabs.contains("connection_manager.scope_policy_preview"));
+    assert!(connection_tabs.contains("connection_manager.enable_mcp"));
+
+    let english_catalog = read_workspace_file("../dory_i18n/locales/en.yml");
+    assert!(english_catalog.contains("scope_policy_preview: Scope/policy assignment preview"));
+    assert!(english_catalog.contains("enable_mcp: Enable MCP for this connection"));
+}
+
+#[test]
+fn ui_contains_approval_and_audit_controls_with_workspace_wiring() {
+    let governance_view = read_workspace_file("../dory_ui_document/src/governance.rs");
+    let workspace_actions = read_workspace_module("../dory_ui/src/ui/views/workspace/actions");
+    let workspace_dispatch = read_workspace_module("../dory_ui/src/ui/views/workspace/dispatch");
+    let workspace_mod = read_workspace_file("../dory_ui/src/ui/views/workspace/mod.rs");
+
+    assert!(governance_view.contains("mcp-approval-approve"));
+    assert!(governance_view.contains("mcp-approval-reject"));
+    // Audit is routed through the unified AuditDocument, not a separate MCP audit view
+    assert!(!governance_view.contains("mcp-audit-export-csv"));
+    assert!(!governance_view.contains("mcp-audit-export-json"));
+
+    assert!(workspace_actions.contains("open_mcp_approvals"));
+    // No separate MCP audit command — unified into OpenAuditViewer
+    assert!(!workspace_actions.contains("open_mcp_audit"));
+    assert!(workspace_dispatch.contains("Command::OpenMcpApprovals"));
+    assert!(!workspace_dispatch.contains("Command::OpenMcpAudit"));
+    assert!(workspace_dispatch.contains("Command::RefreshMcpGovernance"));
+    assert!(workspace_mod.contains("McpRuntimeEventRaised"));
+}
+
+#[test]
+fn audit_workspace_actions_retarget_existing_document_and_close_governance_overlay() {
+    let audit_document = read_workspace_file("../dory_ui_document/src/audit/mod.rs");
+    let workspace_actions = read_workspace_module("../dory_ui/src/ui/views/workspace/actions");
+
+    assert!(audit_document.contains("pub fn set_category_filter"));
+    assert!(audit_document.contains("doc.pending_initial_load = false;"));
+
+    // Unified audit viewer clears MCP filter when opened generically.
+    // After Arc 5 migration, the reset goes through the pane's set_category_filter closure.
+    assert!(workspace_actions.contains("pane.set_category_filter"));
+    assert!(workspace_actions.contains("self.active_governance_panel = None;"));
+}
+
+#[test]
+fn approvals_view_surfaces_failures_instead_of_swallowing_them() {
+    let governance_view = read_workspace_file("../dory_ui_document/src/governance.rs");
+
+    assert!(!governance_view.contains("let _ = state.approve_mcp_pending_execution"));
+    assert!(!governance_view.contains("let _ = state.reject_mcp_pending_execution"));
+    assert!(governance_view.contains("self.status_message = Some(error);"));
+}

@@ -1,0 +1,53 @@
+[package]
+name = "dory_driver_host"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Driver host process for Dory IPC architecture"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dory-driver-host"
+path = "src/main.rs"
+
+[dependencies]
+dory_core = { path = "../dory_core", features = ["tracing-bridge"] }
+dory_ipc = { path = "../dory_ipc" }
+interprocess.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+log.workspace = true
+
+[features]
+sqlite = ["dory_driver_sqlite"]
+postgres = ["dory_driver_postgres"]
+mysql = ["dory_driver_mysql"]
+mongodb = ["dory_driver_mongodb"]
+redis = ["dory_driver_redis"]
+dynamodb = ["dory_driver_dynamodb"]
+
+[dependencies.dory_driver_sqlite]
+path = "../dory_driver_sqlite"
+optional = true
+
+[dependencies.dory_driver_postgres]
+path = "../dory_driver_postgres"
+optional = true
+
+[dependencies.dory_driver_mysql]
+path = "../dory_driver_mysql"
+optional = true
+
+[dependencies.dory_driver_mongodb]
+path = "../dory_driver_mongodb"
+optional = true
+
+[dependencies.dory_driver_redis]
+path = "../dory_driver_redis"
+optional = true
+
+[dependencies.dory_driver_dynamodb]
+path = "../dory_driver_dynamodb"
+optional = true

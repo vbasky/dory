@@ -1,0 +1,55 @@
+[package]
+name = "dory_ui"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "GPUI UI layer for Dory"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+dory_components.workspace = true
+dory_i18n.workspace = true
+dory_ui_base.workspace = true
+dory_ui_document.workspace = true
+dory_ui_windows.workspace = true
+dory_ui_sidebar.workspace = true
+dory_core.workspace = true
+dory_storage.workspace = true
+dory_app.workspace = true
+dory_ipc.workspace = true
+dory_ssh.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+log.workspace = true
+serde_json.workspace = true
+rfd.workspace = true
+fuzzy-matcher.workspace = true
+interprocess.workspace = true
+open = "5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+# dory_ui is driver-agnostic: it has no per-driver features and no driver
+# dependencies. The cross-cutting features only forward to the workspace/app and
+# the sibling UI crates so a single feature set is unified across the build.
+default = ["lua", "aws", "mcp"]
+lua = ["dory_app/lua", "dory_ui_base/lua", "dory_ui_document/lua", "dory_ui_windows/lua", "dory_ui_sidebar/lua"]
+aws = ["dory_app/aws", "dory_ui_base/aws", "dory_ui_document/aws", "dory_ui_windows/aws", "dory_ui_sidebar/aws"]
+mcp = ["dory_app/mcp", "dory_ui_base/mcp", "dory_ui_document/mcp", "dory_ui_windows/mcp", "dory_ui_sidebar/mcp"]
+vendored-openssl = ["dory_ssh/vendored-openssl"]
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
+[package.metadata.cargo-machete]
+# dory_ssh is used only via the vendored-openssl feature passthrough
+# (no direct source usage needed — the dep only forwards the feature).
+ignored = ["dory_ssh"]

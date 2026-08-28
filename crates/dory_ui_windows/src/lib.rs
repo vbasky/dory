@@ -1,0 +1,14 @@
+//! Connection manager, settings, and shared SSH UI for Dory.
+//!
+//! This crate holds the windows subsystem extracted from `dory_ui`:
+//! the Connection Manager window, the Settings window, and shared SSH
+//! authentication UI helpers.
+
+#![recursion_limit = "2048"]
+
+pub mod connection_manager;
+pub mod settings;
+pub mod ssh_shared;
+
+mod labels;
+mod style_guardrails;

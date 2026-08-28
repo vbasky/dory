@@ -1,0 +1,1261 @@
+use super::*;
+use crate::keymap::ContextId;
+use dory_components::composites::{PanelHeaderVariant, panel_header_collapsible_variant};
+use dory_components::controls::Button;
+use dory_components::modals::shell::{ModalShell, ModalVariant};
+use dory_components::primitives::{Chord, Icon, Text};
+use dory_components::typography::Body;
+use dory_ui_base::modal_frame::ModalFrame;
+use dory_ui_base::platform;
+use gpui_component::IconName;
+
+impl Workspace {
+    /// Renders the active document from TabManager (v0.3).
+    ///
+    /// Routes through `TabManager::render_active` so that both `Legacy` and
+    /// `Pane` tabs produce output. The old `active_document().map(render)` path
+    /// returned `None` for `Pane` tabs, leaving `ChartDocument` with an empty
+    /// canvas.
+    fn render_active_document(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        self.tab_manager
+            .update(cx, |mgr, cx| mgr.render_active(window, cx))
+    }
+}
+
+/// One row of the empty-workspace placeholder: a `Chord` followed by a
+/// muted description.
+fn empty_state_shortcut<const N: usize>(
+    keys: [&'static str; N],
+    description: impl Into<gpui::SharedString>,
+) -> gpui::Div {
+    gpui::div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(Chord::new(keys))
+        .child(Text::dim_secondary(description))
+}
+
+impl Render for Workspace {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(command_id) = self.pending_command.take() {
+            self.handle_command(command_id, window, cx);
+            self.focus_handle.focus(window);
+        }
+
+        // Handle SQL generated from sidebar (e.g., SELECT * FROM table)
+        if let Some(sql) = self.pending_sql.take() {
+            self.new_query_tab_with_content(sql, window, cx);
+        }
+
+        if let Some(target) = self.pending_focus.take() {
+            self.set_focus(target, window, cx);
+        }
+
+        if let Some(pending) = self.pending_open_script.take() {
+            self.finalize_open_script(pending, window, cx);
+        }
+
+        if let Some(pending) = self.pending_open_routine.take() {
+            self.finalize_open_routine(pending, window, cx);
+        }
+
+        // Drains `BucketsTableDocument::pending_open_bucket` (Enter-on-row)
+        // via the generic `Tab::take_pending_open_bucket` optional helper —
+        // the workspace never branches on document type, it just polls the
+        // active tab for the intent and opens the object browser on `Some`.
+        let pending_bucket_open = {
+            let active_id = self.tab_manager.read(cx).active_id();
+            active_id.and_then(|id| {
+                self.tab_manager.update(cx, |mgr, cx| {
+                    mgr.document(id).and_then(|tab| {
+                        tab.take_pending_open_bucket(cx)
+                            .map(|bucket| (tab.connection_id(cx), bucket))
+                    })
+                })
+            })
+        };
+        if let Some((Some(profile_id), bucket)) = pending_bucket_open {
+            self.open_object_browser(profile_id, bucket, window, cx);
+        }
+
+        // Same generic drain for "open this text object in its own editor
+        // tab", raised by the object browser's preview header and its row
+        // context menu.
+        let pending_object_editor_open = {
+            let active_id = self.tab_manager.read(cx).active_id();
+            active_id.and_then(|id| {
+                self.tab_manager.update(cx, |mgr, cx| {
+                    mgr.document(id).and_then(|tab| {
+                        tab.take_pending_open_object_editor(cx)
+                            .map(|request| (tab.connection_id(cx), request))
+                    })
+                })
+            })
+        };
+        if let Some((Some(profile_id), request)) = pending_object_editor_open {
+            self.open_object_editor(profile_id, request, window, cx);
+        }
+
+        if self.needs_focus_restore {
+            self.needs_focus_restore = false;
+            self.set_focus(self.focus_target, window, cx);
+        }
+
+        // Open the login modal on behalf of a settings-window auth-profile login.
+        if let Some((provider_name, profile_name, url)) = self.pending_login_modal_open.take() {
+            self.login_modal.update(cx, |modal, cx| {
+                modal.open_manual(provider_name, profile_name, url, window, cx);
+            });
+        }
+
+        let sidebar_dock = self.sidebar_dock.clone();
+        let status_bar = self.status_bar.clone();
+        let tasks_panel = self.tasks_panel.clone();
+        let toast_host = self.toast_host.clone();
+        let command_palette = self.command_palette.clone();
+        let login_modal = self.login_modal.clone();
+        let sso_wizard = self.sso_wizard.clone();
+
+        let tab_bar = self.tab_bar.clone();
+        let has_tabs = !self.tab_manager.read(cx).is_empty();
+        let active_doc_element = self.render_active_document(window, cx);
+        let inspector_open = self.workspace_inspector.read(cx).is_open();
+        let inspector_resizing = self.workspace_inspector.read(cx).is_resizing();
+        let inspector_entity = self.workspace_inspector.clone();
+
+        let tasks_expanded = self.tasks_state.is_expanded();
+        let tasks_focused = self.focus_target == FocusTarget::BackgroundTasks;
+
+        let theme = cx.theme().clone();
+        let bg_color = theme.background;
+        let muted_fg = theme.muted_foreground;
+        let header_size = px(25.0);
+        let sidebar_context_menu = self.sidebar.read(cx).context_menu_state().cloned();
+        let tab_context_menu = self.tab_bar.read(cx).context_menu_state().cloned();
+        let child_picker_open = self.sidebar.read(cx).has_child_picker_open();
+
+        // Linux CSD title bar: render only when the compositor has negotiated CSD mode.
+        // Include the active connection name as a breadcrumb when connected.
+        let crumbs: Vec<platform::TitleCrumb> = {
+            let connection_name = self
+                .app_state
+                .read(cx)
+                .active_connection()
+                .map(|c| c.profile.name.clone());
+
+            if let Some(name) = connection_name {
+                vec![platform::TitleCrumb {
+                    icon: Some(crate::ui::icons::AppIcon::Database),
+                    label: name.into(),
+                }]
+            } else {
+                vec![]
+            }
+        };
+        let linux_title_bar =
+            platform::render_csd_title_bar_with_crumbs(window, cx, "Dory", &crumbs);
+
+        let right_pane = if has_tabs {
+            let workspace = cx.entity().clone();
+            let tasks_header = panel_header_collapsible_variant(
+                "panel-header-Background Tasks",
+                dory_i18n::t!("workspace.background_tasks"),
+                PanelHeaderVariant::WorkspaceTasks,
+                !tasks_expanded,
+                tasks_focused,
+                Some(IconName::Loader),
+                move |_, _, app| {
+                    workspace.update(app, |workspace, cx| {
+                        workspace.toggle_tasks_panel(cx);
+                    });
+                },
+                cx,
+            );
+
+            v_resizable("main-panels")
+                .child(
+                    resizable_panel()
+                        .size(px(500.0))
+                        .size_range(px(200.0)..px(2000.0))
+                        .child(
+                            div()
+                                .id("document-area")
+                                .flex()
+                                .flex_col()
+                                .size_full()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        if this.focus_target != FocusTarget::Document {
+                                            this.set_focus(FocusTarget::Document, window, cx);
+                                        }
+                                    }),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(|this, _, window, cx| {
+                                        if this.focus_target != FocusTarget::Document {
+                                            this.set_focus(FocusTarget::Document, window, cx);
+                                        }
+                                    }),
+                                )
+                                .child(tab_bar)
+                                // doc + inspector live in a flex_row under the tab bar.
+                                .child(
+                                    div()
+                                        .id("document-content-row")
+                                        .flex()
+                                        .flex_row()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .overflow_hidden()
+                                        .when_some(active_doc_element, |el, doc| {
+                                            el.child(
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .flex_1()
+                                                    .min_h_0()
+                                                    .overflow_hidden()
+                                                    .child(doc),
+                                            )
+                                        })
+                                        .when(inspector_open, |el| {
+                                            el.child(inspector_entity.clone())
+                                        }),
+                                ),
+                        ),
+                )
+                .child(
+                    resizable_panel()
+                        .size(if tasks_expanded {
+                            px(150.0)
+                        } else {
+                            header_size
+                        })
+                        .size_range(if tasks_expanded {
+                            px(80.0)..px(2000.0)
+                        } else {
+                            header_size..header_size
+                        })
+                        .child(
+                            div()
+                                .id("tasks-panel")
+                                .flex()
+                                .flex_col()
+                                .size_full()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        if this.focus_target != FocusTarget::BackgroundTasks {
+                                            this.set_focus(
+                                                FocusTarget::BackgroundTasks,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }),
+                                )
+                                .child(tasks_header)
+                                .when(tasks_expanded, |el| {
+                                    el.child(div().flex_1().overflow_hidden().child(tasks_panel))
+                                }),
+                        ),
+                )
+        } else {
+            // Empty state: welcome message + tasks panel
+            let workspace = cx.entity().clone();
+            let tasks_header_empty = panel_header_collapsible_variant(
+                "panel-header-Background Tasks",
+                dory_i18n::t!("workspace.background_tasks"),
+                PanelHeaderVariant::WorkspaceTasks,
+                !tasks_expanded,
+                tasks_focused,
+                Some(IconName::Loader),
+                move |_, _, app| {
+                    workspace.update(app, |workspace, cx| {
+                        workspace.toggle_tasks_panel(cx);
+                    });
+                },
+                cx,
+            );
+
+            v_resizable("main-panels")
+                .child(
+                    resizable_panel()
+                        .size(px(500.0))
+                        .size_range(px(200.0)..px(2000.0))
+                        .child(
+                            div()
+                                .id("empty-state")
+                                .flex()
+                                .flex_col()
+                                .size_full()
+                                .items_center()
+                                .justify_center()
+                                .gap_4()
+                                .child(
+                                    Icon::new(AppIcon::Database)
+                                        .size(px(64.0))
+                                        .color(muted_fg.opacity(0.5)),
+                                )
+                                .child(
+                                    Body::new(dory_i18n::t!("workspace.empty_documents")).muted(cx),
+                                )
+                                .child(
+                                    div()
+                                        .mt_4()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .child(empty_state_shortcut(
+                                            ["Ctrl", "N"],
+                                            dory_i18n::t!("workspace.hint.new_query"),
+                                        ))
+                                        .child(empty_state_shortcut(
+                                            ["Ctrl", "Shift", "P"],
+                                            dory_i18n::t!("workspace.hint.command_palette"),
+                                        ))
+                                        .child(empty_state_shortcut(
+                                            ["Ctrl", "O"],
+                                            dory_i18n::t!("workspace.hint.open"),
+                                        ))
+                                        .child(empty_state_shortcut(
+                                            ["Ctrl", "Shift", "N"],
+                                            dory_i18n::t!("workspace.hint.new_connection"),
+                                        )),
+                                ),
+                        ),
+                )
+                .child(
+                    resizable_panel()
+                        .size(if tasks_expanded {
+                            px(150.0)
+                        } else {
+                            header_size
+                        })
+                        .size_range(if tasks_expanded {
+                            px(80.0)..px(2000.0)
+                        } else {
+                            header_size..header_size
+                        })
+                        .child(
+                            div()
+                                .id("tasks-panel")
+                                .flex()
+                                .flex_col()
+                                .size_full()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        if this.focus_target != FocusTarget::BackgroundTasks {
+                                            this.set_focus(
+                                                FocusTarget::BackgroundTasks,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }),
+                                )
+                                .child(tasks_header_empty)
+                                .when(tasks_expanded, |el| {
+                                    el.child(
+                                        div().flex_1().overflow_hidden().child(tasks_panel.clone()),
+                                    )
+                                }),
+                        ),
+                )
+        };
+
+        let focus_handle = self.focus_handle.clone();
+
+        div()
+            .id("workspace-root")
+            .relative()
+            .size_full()
+            .bg(bg_color)
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if this.sidebar_dock.read(cx).is_resizing() {
+                    this.sidebar_dock.update(cx, |dock, cx| {
+                        dock.handle_resize_move(event.position.x, cx);
+                    });
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.sidebar_dock.read(cx).is_resizing() {
+                        this.sidebar_dock.update(cx, |dock, cx| {
+                            dock.finish_resize(cx);
+                        });
+                    }
+                }),
+            )
+            .track_focus(&focus_handle)
+            .on_action(
+                cx.listener(|this, _: &keymap::ToggleCommandPalette, window, cx| {
+                    this.toggle_command_palette(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &keymap::NewQueryTab, window, cx| {
+                this.new_query_tab(window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &keymap::CloseCurrentTab, window, cx| {
+                    this.close_active_tab(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &keymap::NextTab, _window, cx| {
+                this.tab_manager.update(cx, |mgr, cx| {
+                    mgr.next_visual_tab(cx);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &keymap::PrevTab, _window, cx| {
+                this.tab_manager.update(cx, |mgr, cx| {
+                    mgr.prev_visual_tab(cx);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SwitchToTab1, _window, cx| {
+                this.tab_manager
+                    .update(cx, |mgr, cx| mgr.switch_to_tab(1, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SwitchToTab2, _window, cx| {
+                this.tab_manager
+                    .update(cx, |mgr, cx| mgr.switch_to_tab(2, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SwitchToTab3, _window, cx| {
+                this.tab_manager
+                    .update(cx, |mgr, cx| mgr.switch_to_tab(3, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SwitchToTab4, _window, cx| {
+                this.tab_manager
+                    .update(cx, |mgr, cx| mgr.switch_to_tab(4, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SwitchToTab5, _window, cx| {
+                this.tab_manager
+                    .update(cx, |mgr, cx| mgr.switch_to_tab(5, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SwitchToTab6, _window, cx| {
+                this.tab_manager
+                    .update(cx, |mgr, cx| mgr.switch_to_tab(6, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SwitchToTab7, _window, cx| {
+                this.tab_manager
+                    .update(cx, |mgr, cx| mgr.switch_to_tab(7, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SwitchToTab8, _window, cx| {
+                this.tab_manager
+                    .update(cx, |mgr, cx| mgr.switch_to_tab(8, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SwitchToTab9, _window, cx| {
+                this.tab_manager
+                    .update(cx, |mgr, cx| mgr.switch_to_tab(9, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keymap::FocusSidebar, window, cx| {
+                this.set_focus(FocusTarget::Sidebar, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::FocusEditor, window, cx| {
+                this.set_focus(FocusTarget::Document, window, cx);
+                this.tab_manager.update(cx, |mgr, cx| {
+                    mgr.dispatch_active(Command::FocusUp, window, cx);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &keymap::FocusResults, window, cx| {
+                this.set_focus(FocusTarget::Document, window, cx);
+                this.tab_manager.update(cx, |mgr, cx| {
+                    mgr.dispatch_active(Command::FocusDown, window, cx);
+                });
+            }))
+            .on_action(
+                cx.listener(|this, _: &keymap::FocusBackgroundTasks, window, cx| {
+                    this.set_focus(FocusTarget::BackgroundTasks, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &keymap::CycleFocusForward, window, cx| {
+                    let next = this.next_focus_target(cx);
+                    this.set_focus(next, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &keymap::CycleFocusBackward, window, cx| {
+                    let prev = this.prev_focus_target(cx);
+                    this.set_focus(prev, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &keymap::FocusLeft, window, cx| {
+                this.dispatch(Command::FocusLeft, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::FocusRight, window, cx| {
+                this.dispatch(Command::FocusRight, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::FocusUp, window, cx| {
+                this.dispatch(Command::FocusUp, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::FocusDown, window, cx| {
+                this.dispatch(Command::FocusDown, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::RunQuery, window, cx| {
+                this.tab_manager.update(cx, |mgr, cx| {
+                    mgr.dispatch_active(Command::RunQuery, window, cx);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &keymap::Cancel, window, cx| {
+                if !this.dispatch(Command::Cancel, window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ExportResults, window, cx| {
+                this.tab_manager.update(cx, |mgr, cx| {
+                    mgr.dispatch_active(Command::ExportResults, window, cx);
+                });
+            }))
+            .on_action(
+                cx.listener(|this, _: &keymap::OpenConnectionManager, _window, cx| {
+                    this.open_connection_manager(cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &keymap::Disconnect, window, cx| {
+                this.disconnect_active(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::RefreshSchema, window, cx| {
+                this.refresh_schema(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ToggleEditor, window, cx| {
+                this.tab_manager.update(cx, |mgr, cx| {
+                    mgr.dispatch_active(Command::ToggleEditor, window, cx);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ToggleResults, window, cx| {
+                this.tab_manager.update(cx, |mgr, cx| {
+                    mgr.dispatch_active(Command::ToggleResults, window, cx);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ToggleTasks, _window, cx| {
+                this.toggle_tasks_panel(cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ToggleSidebar, _window, cx| {
+                this.toggle_sidebar(cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::OpenSettings, _window, cx| {
+                this.open_settings(cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::OpenScriptFile, window, cx| {
+                this.open_script_file(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SaveFileAs, window, cx| {
+                this.tab_manager.update(cx, |mgr, cx| {
+                    mgr.dispatch_active(Command::SaveFileAs, window, cx);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SaveQuery, window, cx| {
+                this.tab_manager.update(cx, |mgr, cx| {
+                    mgr.dispatch_active(Command::SaveQuery, window, cx);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &keymap::CancelQuery, window, cx| {
+                this.tab_manager.update(cx, |mgr, cx| {
+                    mgr.dispatch_active(Command::CancelQuery, window, cx);
+                });
+            }))
+            .on_action(
+                cx.listener(|this, _: &keymap::OpenSavedQueries, window, cx| {
+                    this.dispatch(Command::OpenSavedQueries, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &keymap::OpenAuditViewer, window, cx| {
+                    this.dispatch(Command::OpenAuditViewer, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &keymap::OpenSavedChart, window, cx| {
+                this.dispatch(Command::OpenSavedChart, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &keymap::ImportDashboard, window, cx| {
+                    this.dispatch(Command::ImportDashboard, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &keymap::NewDashboard, window, cx| {
+                this.dispatch(Command::NewDashboard, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ResultsAddRow, window, cx| {
+                this.tab_manager.update(cx, |mgr, cx| {
+                    mgr.dispatch_active(Command::ResultsAddRow, window, cx);
+                });
+            }))
+            .on_action(
+                cx.listener(|this, _: &keymap::ResultsDuplicateRow, window, cx| {
+                    this.tab_manager.update(cx, |mgr, cx| {
+                        mgr.dispatch_active(Command::ResultsDuplicateRow, window, cx);
+                    });
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &keymap::ResultsCopyCell, window, cx| {
+                    this.tab_manager.update(cx, |mgr, cx| {
+                        mgr.dispatch_active(Command::ResultsCopyCell, window, cx);
+                    });
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &keymap::ResultsDeleteRow, window, cx| {
+                    this.tab_manager.update(cx, |mgr, cx| {
+                        mgr.dispatch_active(Command::ResultsDeleteRow, window, cx);
+                    });
+                }),
+            )
+            // List navigation actions - propagate if not handled so editor can receive keys
+            .on_action(cx.listener(|this, _: &keymap::SelectNext, window, cx| {
+                if !this.dispatch(Command::SelectNext, window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SelectPrev, window, cx| {
+                if !this.dispatch(Command::SelectPrev, window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SelectFirst, window, cx| {
+                if !this.dispatch(Command::SelectFirst, window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::SelectLast, window, cx| {
+                if !this.dispatch(Command::SelectLast, window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::Execute, window, cx| {
+                if !this.dispatch(Command::Execute, window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ExpandCollapse, window, cx| {
+                if !this.dispatch(Command::ExpandCollapse, window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ColumnLeft, window, cx| {
+                if !this.dispatch(Command::ColumnLeft, window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ColumnRight, window, cx| {
+                if !this.dispatch(Command::ColumnRight, window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::FocusToolbar, window, cx| {
+                if !this.dispatch(Command::FocusToolbar, window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::TogglePanel, window, cx| {
+                if !this.dispatch(Command::TogglePanel, window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let chord = key_chord_from_gpui(&event.keystroke);
+                let context = this.active_context(cx);
+
+                if let Some(cmd) = this.keymap.resolve(context, &chord)
+                    && this.dispatch(cmd, window, cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .when_some(linux_title_bar, |el, title_bar| el.child(title_bar))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_1()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .id("sidebar-panel")
+                                    .h_full()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            if !this.is_sidebar_collapsed(cx)
+                                                && this.focus_target != FocusTarget::Sidebar
+                                            {
+                                                this.set_focus(FocusTarget::Sidebar, window, cx);
+                                            }
+                                        }),
+                                    )
+                                    .child(sidebar_dock),
+                            )
+                            .child(div().flex_1().overflow_hidden().child(right_pane)),
+                    )
+                    .child(status_bar),
+            )
+            .child(command_palette)
+            .child(self.sql_preview_modal.clone())
+            .child(login_modal)
+            .child(sso_wizard)
+            // S8 modals — rendered as full-screen overlays using ModalShell chrome.
+            .when(self.modal_delete_connection.read(cx).is_visible(), |root| {
+                root.child(self.modal_delete_connection.clone())
+            })
+            .when(self.modal_unsaved_changes.read(cx).is_visible(), |root| {
+                root.child(self.modal_unsaved_changes.clone())
+            })
+            .when(self.modal_drop_table.read(cx).is_visible(), |root| {
+                root.child(self.modal_drop_table.clone())
+            })
+            .when(self.modal_tunnel_auth.read(cx).is_visible(), |root| {
+                root.child(self.modal_tunnel_auth.clone())
+            })
+            .when(self.modal_import_dashboard.read(cx).is_visible(), |root| {
+                root.child(self.modal_import_dashboard.clone())
+            })
+            .when(self.import_wizard.read(cx).is_visible(), |root| {
+                root.child(self.import_wizard.clone())
+            })
+            .when(self.migrate_wizard.read(cx).is_visible(), |root| {
+                root.child(self.migrate_wizard.clone())
+            })
+            .when(self.export_wizard.read(cx).is_visible(), |root| {
+                root.child(self.export_wizard.clone())
+            })
+            .when(self.modal_create_dashboard.read(cx).is_visible(), |root| {
+                root.child(self.modal_create_dashboard.clone())
+            })
+            .when(self.modal_rename_item.read(cx).is_visible(), |root| {
+                root.child(self.modal_rename_item.clone())
+            })
+            .when(self.modal_delete_dashboard.read(cx).is_visible(), |root| {
+                root.child(self.modal_delete_dashboard.clone())
+            })
+            .when(
+                self.modal_delete_saved_chart.read(cx).is_visible(),
+                |root| root.child(self.modal_delete_saved_chart.clone()),
+            )
+            .when(self.modal_add_panel.read(cx).is_visible(), |root| {
+                root.child(self.modal_add_panel.clone())
+            })
+            .when(self.export_modal.read(cx).is_visible(), |root| {
+                root.child(self.export_modal.clone())
+            })
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .child(toast_host),
+            )
+            // Drag mask — rendered only while inspector grip is being dragged.
+            // Sits above document/inspector content so cursor tracking works
+            // anywhere on screen, but below toast host and shutdown overlay.
+            .when(inspector_resizing, |root| {
+                root.child(
+                    div()
+                        .id("workspace-inspector-drag-mask")
+                        .absolute()
+                        .inset_0()
+                        .cursor_col_resize()
+                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                            this.workspace_inspector.update(cx, |insp, cx| {
+                                insp.update_resize(event.position.x, cx);
+                            });
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.workspace_inspector.update(cx, |insp, cx| {
+                                    insp.finish_resize(cx);
+                                });
+                            }),
+                        ),
+                )
+            })
+            // Shutdown overlay (rendered above everything during shutdown)
+            .child(self.shutdown_overlay.clone())
+            .when(cfg!(feature = "mcp"), |root| {
+                #[cfg(feature = "mcp")]
+                {
+                    root.when_some(self.active_governance_panel, |root, panel| {
+                        let _close_entity = cx.entity().clone();
+                        let title = match panel {
+                            super::GovernancePanel::Approvals => {
+                                dory_i18n::t!("workspace.mcp_approvals")
+                            }
+                        };
+
+                        let content = match panel {
+                            super::GovernancePanel::Approvals => {
+                                self.mcp_approvals_view.clone().into_any_element()
+                            }
+                        };
+
+                        root.child(
+                            div()
+                                .id("governance-overlay")
+                                .absolute()
+                                .inset_0()
+                                .bg(theme.overlay.opacity(0.45))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    div()
+                                        .w(px(1080.0))
+                                        .h(px(680.0))
+                                        .bg(theme.sidebar)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .rounded(Radii::MD)
+                                        .overflow_hidden()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .h(px(40.0))
+                                                .px(Spacing::MD)
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .border_b_1()
+                                                .border_color(theme.border)
+                                                .child(Text::heading(title)),
+                                        )
+                                        .child(div().flex_1().min_h_0().child(content)),
+                                ),
+                        )
+                    })
+                }
+                #[cfg(not(feature = "mcp"))]
+                {
+                    root
+                }
+            })
+            .when(child_picker_open, |root| {
+                let sidebar_entity = self.sidebar.clone();
+                let focus_handle = self
+                    .sidebar
+                    .read(cx)
+                    .child_picker_focus_handle()
+                    .unwrap_or_else(|| self.focus_handle.clone());
+                let content = self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.render_child_picker_content(cx).into_any_element()
+                });
+
+                root.child(
+                    ModalFrame::new(
+                        "event-stream-child-picker",
+                        &focus_handle,
+                        move |_window, cx| {
+                            sidebar_entity.update(cx, |sidebar, cx| {
+                                sidebar.close_child_picker(cx);
+                            });
+                        },
+                    )
+                    .context_id(ContextId::EventStreamsPicker)
+                    .icon(AppIcon::ScrollText)
+                    .title(dory_i18n::t!("workspace.event_streams"))
+                    .width(px(1000.0))
+                    .height(px(720.0))
+                    .top_offset(px(60.0))
+                    .block_scroll()
+                    .child(content)
+                    .render(cx),
+                )
+            })
+            // Context menu rendered at workspace level for proper positioning
+            .when_some(sidebar_context_menu, |this, menu| {
+                use crate::ui::components::context_menu as ctx;
+                use dory_ui_sidebar::ContextMenuItem;
+
+                let sidebar_entity = self.sidebar.clone();
+
+                let menu_x = menu.position.x;
+                let menu_y = menu.position.y;
+                let menu_width = px(160.0);
+                let menu_gap = Spacing::XS;
+                let menu_item_height = Heights::ROW_COMPACT;
+                let separator_height = px(1.0) + Spacing::XS * 2.0;
+                let menu_container_padding = px(4.0);
+
+                let parent_entry = menu.parent_stack.last();
+
+                // Anchor the submenu to its owning row by summing the actual
+                // rendered height of every preceding row. Separators are ~9px,
+                // not a full ROW_COMPACT, so a flat `height * index` over-counts
+                // and pushes the submenu too far down.
+                let submenu_y_offset = if let Some((parent_items, parent_selected)) = parent_entry {
+                    let rows_above =
+                        parent_items
+                            .iter()
+                            .take(*parent_selected)
+                            .fold(px(0.0), |acc, item| {
+                                acc + if item.is_separator {
+                                    separator_height
+                                } else {
+                                    menu_item_height
+                                }
+                            });
+
+                    menu_container_padding + rows_above
+                } else {
+                    px(0.0)
+                };
+
+                let in_submenu = parent_entry.is_some();
+
+                // Overlay to dismiss on outside click
+                let sidebar_dismiss = sidebar_entity.clone();
+                let overlay = ctx::render_menu_overlay("context-menu-overlay", move |_, cx| {
+                    sidebar_dismiss.update(cx, |s, cx| s.close_context_menu(cx));
+                });
+
+                this.child(overlay)
+                    // Parent menu (shown when in submenu, at original position)
+                    .when_some(parent_entry, |d, (parent_items, parent_selected)| {
+                        let shared_items = ContextMenuItem::to_menu_items(parent_items);
+                        let sidebar_click = sidebar_entity.clone();
+                        let sidebar_hover = sidebar_entity.clone();
+
+                        d.child(
+                            deferred(
+                                anchored()
+                                    .position(point(menu_x, menu_y))
+                                    .snap_to_window()
+                                    .child(ctx::render_menu_container(
+                                        "parent-menu",
+                                        &shared_items,
+                                        Some(*parent_selected),
+                                        move |idx, cx| {
+                                            sidebar_click.update(cx, |s, cx| {
+                                                s.context_menu_parent_execute_at(idx, cx);
+                                            });
+                                        },
+                                        move |idx, cx| {
+                                            sidebar_hover.update(cx, |s, cx| {
+                                                s.context_menu_parent_hover_at(idx, cx);
+                                            });
+                                        },
+                                        cx,
+                                    )),
+                            )
+                            .with_priority(1),
+                        )
+                    })
+                    // Current menu (submenu to the right of parent, or main menu at click position)
+                    .child({
+                        let shared_items = ContextMenuItem::to_menu_items(&menu.items);
+                        let sidebar_click = sidebar_entity.clone();
+                        let sidebar_hover = sidebar_entity.clone();
+
+                        let menu_left = if in_submenu {
+                            menu_x + menu_width + menu_gap
+                        } else {
+                            menu_x
+                        };
+                        let menu_top = menu_y + submenu_y_offset;
+
+                        deferred(
+                            anchored()
+                                .position(point(menu_left, menu_top))
+                                .snap_to_window()
+                                .child(ctx::render_menu_container(
+                                    "context-menu",
+                                    &shared_items,
+                                    Some(menu.selected_index),
+                                    move |idx, cx| {
+                                        sidebar_click.update(cx, |s, cx| {
+                                            s.context_menu_execute_at(idx, cx);
+                                        });
+                                    },
+                                    move |idx, cx| {
+                                        sidebar_hover.update(cx, |s, cx| {
+                                            s.context_menu_hover_at(idx, cx);
+                                        });
+                                    },
+                                    cx,
+                                )),
+                        )
+                        .with_priority(1)
+                    })
+            })
+            // Tab context menu rendered at workspace level for proper positioning
+            .when_some(tab_context_menu, |this, menu| {
+                use crate::ui::components::context_menu as ctx;
+                use crate::ui::document::tab_bar::TabBar;
+
+                let tab_bar_entity = self.tab_bar.clone();
+
+                let menu_x = menu.position_x;
+                let menu_y = px(36.0);
+                let items = TabBar::build_tab_menu_items();
+                let selected = menu.selected_index;
+
+                let tab_bar_dismiss = tab_bar_entity.clone();
+                let overlay = ctx::render_menu_overlay("tab-context-menu-overlay", move |_, cx| {
+                    tab_bar_dismiss.update(cx, |tb, cx| tb.close_context_menu(cx));
+                });
+
+                let tab_bar_click = tab_bar_entity.clone();
+                let tab_bar_hover = tab_bar_entity.clone();
+
+                this.child(overlay)
+                    .child(div().absolute().top(menu_y).left(menu_x).child(
+                        ctx::render_menu_container(
+                            "tab-context-menu",
+                            &items,
+                            Some(selected),
+                            move |idx, cx| {
+                                tab_bar_click.update(cx, |tb, cx| {
+                                    tb.context_menu_execute_at(idx, cx);
+                                });
+                            },
+                            move |idx, cx| {
+                                tab_bar_hover.update(cx, |tb, cx| {
+                                    tb.context_menu_hover_at(idx, cx);
+                                });
+                            },
+                            cx,
+                        ),
+                    ))
+            })
+            // Delete confirmation modal rendered at workspace level for proper centering
+            .when_some(
+                self.sidebar.read(cx).delete_modal_state(),
+                |el, modal_state| {
+                    // Capture sidebar clones for each callback before building the footer.
+                    let sidebar_confirm = self.sidebar.clone();
+                    let sidebar_cancel = self.sidebar.clone();
+                    let sidebar_close = self.sidebar.clone();
+
+                    let title = if modal_state.multi_count.is_some() {
+                        dory_i18n::t!("workspace.action.delete")
+                    } else if modal_state.is_ddl {
+                        dory_i18n::t!("workspace.action.drop")
+                    } else if modal_state.is_folder {
+                        dory_i18n::t!("workspace.action.delete_folder")
+                    } else {
+                        dory_i18n::t!("workspace.action.delete_connection")
+                    };
+
+                    let message = if let Some(count) = modal_state.multi_count {
+                        crate::ui::labels::workspace_delete_selected_message(count)
+                    } else if modal_state.is_ddl {
+                        crate::ui::labels::workspace_drop_object_message(
+                            modal_state.object_type,
+                            modal_state.item_name,
+                        )
+                    } else if modal_state.is_folder {
+                        crate::ui::labels::workspace_delete_folder_message(modal_state.item_name)
+                    } else {
+                        crate::ui::labels::workspace_delete_connection_message(
+                            modal_state.item_name,
+                        )
+                    };
+
+                    let confirm_label = if modal_state.is_ddl {
+                        dory_i18n::t!("workspace.action.drop")
+                    } else {
+                        dory_i18n::t!("workspace.action.delete")
+                    };
+                    let variant = if modal_state.is_ddl {
+                        ModalVariant::Danger
+                    } else {
+                        ModalVariant::Default
+                    };
+
+                    let body = Text::body(message).into_any_element();
+
+                    let footer = div()
+                        .flex()
+                        .gap(Spacing::SM)
+                        .child(
+                            Button::new("delete-cancel", dory_i18n::t!("workspace.action.cancel"))
+                                .on_click(move |_, _, cx| {
+                                    sidebar_cancel.update(cx, |this, cx| {
+                                        this.cancel_modal_delete(cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("delete-confirm", confirm_label)
+                                .when(modal_state.is_ddl, |b| b.danger())
+                                .on_click(move |_, _, cx| {
+                                    sidebar_confirm.update(cx, |this, cx| {
+                                        this.confirm_modal_delete(cx);
+                                    });
+                                }),
+                        )
+                        .into_any_element();
+
+                    el.child(
+                        ModalShell::new(title, body, footer)
+                            .width(px(360.0))
+                            .variant(variant)
+                            .on_close(move |_, cx| {
+                                sidebar_close.update(cx, |this, cx| {
+                                    this.cancel_modal_delete(cx);
+                                });
+                            }),
+                    )
+                },
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use dory_components::composites::{
+        PanelHeaderBackground, PanelHeaderTitleColor, PanelHeaderVariant, inspect_panel_header,
+    };
+    use dory_components::primitives::SurfaceRole;
+    use dory_components::tokens::FontSizes;
+    use dory_components::typography::AppFonts;
+    use gpui::FontWeight;
+
+    #[test]
+    fn panel_headers_keep_ui_family_and_focus_weight_difference() {
+        let focused = inspect_panel_header(PanelHeaderVariant::WorkspaceTasks, true, true, false);
+        let unfocused =
+            inspect_panel_header(PanelHeaderVariant::WorkspaceTasks, true, false, false);
+
+        for inspection in [&focused.title, &unfocused.title] {
+            assert_eq!(inspection.family, Some(AppFonts::BODY));
+            assert_eq!(inspection.fallbacks, &[] as &[&str]);
+            assert_eq!(inspection.size_override, Some(FontSizes::SM));
+        }
+
+        assert_eq!(focused.title.weight_override, Some(FontWeight::BOLD));
+        assert_eq!(unfocused.title.weight_override, Some(FontWeight::MEDIUM));
+    }
+
+    #[test]
+    fn workspace_render_uses_canonical_panel_header_contract() {
+        let source = workspace_render_source();
+
+        assert!(source.contains("panel_header_collapsible_variant("));
+        assert!(source.contains("PanelHeaderVariant::WorkspaceTasks"));
+        assert!(!source.contains("fn background_tasks_panel_header("));
+        assert!(!source.contains("fn render_panel_header("));
+        assert!(!source.contains("fn panel_header_title("));
+    }
+
+    #[test]
+    fn workspace_render_drops_local_background_tasks_header_styling() {
+        let source = workspace_render_source();
+
+        assert!(!source.contains(".bg(theme.tab_bar)"));
+        assert!(!source.contains(".hover(|s| s.bg(theme.secondary))"));
+        assert!(!source.contains("theme.primary"));
+    }
+
+    #[test]
+    fn workspace_render_keeps_loader_icon_in_the_tasks_header_contract() {
+        let source = workspace_render_source();
+
+        assert!(source.contains("Some(IconName::Loader)"));
+    }
+
+    #[test]
+    fn workspace_tasks_panel_variant_matches_expected_shared_chrome() {
+        let collapsed =
+            inspect_panel_header(PanelHeaderVariant::WorkspaceTasks, true, false, false);
+
+        assert_eq!(collapsed.background, PanelHeaderBackground::ThemeTabBar);
+        assert_eq!(
+            collapsed.hover_background,
+            Some(PanelHeaderBackground::Surface(SurfaceRole::Card))
+        );
+        assert_eq!(
+            collapsed.base_title_color,
+            PanelHeaderTitleColor::Foreground
+        );
+
+        let focused = inspect_panel_header(PanelHeaderVariant::WorkspaceTasks, true, true, false);
+
+        assert_eq!(
+            focused.focus_title_color,
+            Some(PanelHeaderTitleColor::Primary)
+        );
+        assert_eq!(focused.title.family, Some(AppFonts::BODY));
+        assert_eq!(focused.title.size_override, Some(FontSizes::SM));
+        assert_eq!(focused.title.weight_override, Some(FontWeight::BOLD));
+    }
+
+    #[test]
+    fn tabbed_and_empty_workspace_paths_both_use_the_workspace_tasks_contract() {
+        let invocations = background_tasks_header_invocations();
+
+        assert_eq!(invocations.len(), 2);
+
+        for invocation in invocations {
+            assert!(invocation.contains("panel_header_collapsible_variant("));
+            assert!(invocation.contains("PanelHeaderVariant::WorkspaceTasks"));
+            assert!(invocation.contains("tasks_focused"));
+            assert!(invocation.contains("Some(IconName::Loader)"));
+        }
+    }
+
+    #[test]
+    fn workspace_background_tasks_contract_stays_out_of_local_helper_code_paths() {
+        let invocations = background_tasks_header_invocations();
+
+        for invocation in invocations {
+            assert!(!invocation.contains("theme.tab_bar"));
+            assert!(!invocation.contains("theme.primary"));
+        }
+    }
+
+    fn workspace_render_source() -> String {
+        let source = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui/views/workspace/render.rs"
+        ))
+        .expect("render.rs should be readable for source-inspection tests");
+
+        source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("render.rs should contain production code before tests")
+            .to_string()
+    }
+
+    fn background_tasks_header_invocations() -> Vec<String> {
+        let source = workspace_render_source();
+        let mut invocations = Vec::new();
+        let mut remaining = source.as_str();
+
+        while let Some(start) = remaining.find("panel_header_collapsible_variant(") {
+            let tail = &remaining[start..];
+            let end = tail
+                .find(",\n                cx,\n            );")
+                .map(|index| index + ",\n                cx,\n            );".len())
+                .expect("workspace render should close the panel_header_collapsible_variant call");
+
+            invocations.push(tail[..end].to_string());
+            remaining = &tail[end..];
+        }
+
+        invocations
+    }
+}

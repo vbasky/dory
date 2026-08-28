@@ -1,0 +1,12 @@
+pub mod app_menus;
+pub mod common;
+pub mod components;
+pub mod dock;
+pub mod document;
+pub mod icons;
+pub(crate) mod labels;
+pub mod overlays;
+pub mod views;
+
+#[cfg(test)]
+mod design_system_guardrails;

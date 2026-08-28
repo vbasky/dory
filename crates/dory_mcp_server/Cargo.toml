@@ -1,0 +1,75 @@
+[package]
+name = "dory_mcp_server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Standalone headless MCP server for Dory"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+name = "dory_mcp_server"
+path = "src/lib.rs"
+
+[features]
+sqlite = ["dory_driver_sqlite"]
+postgres = ["dory_driver_postgres"]
+mysql = ["dory_driver_mysql"]
+mongodb = ["dory_driver_mongodb"]
+redis = ["dory_driver_redis"]
+dynamodb = ["dory_driver_dynamodb"]
+redshift = ["dory_driver_redshift"]
+clickhouse = ["dory_driver_clickhouse"]
+aws = ["dory_aws", "dory_ssm"]
+
+[dependencies]
+# Dory core crates
+dory_core = { workspace = true, features = ["tracing-bridge"] }
+dory_mcp = { workspace = true }
+dory_policy = { workspace = true }
+dory_approval = { workspace = true }
+dory_audit = { workspace = true }
+dory_storage = { workspace = true }
+dory_ipc = { workspace = true }
+
+# Optional driver crates
+dory_driver_sqlite = { workspace = true, optional = true }
+dory_driver_postgres = { workspace = true, optional = true }
+dory_driver_mysql = { workspace = true, optional = true }
+dory_driver_mongodb = { workspace = true, optional = true }
+dory_driver_redis = { workspace = true, optional = true }
+dory_driver_dynamodb = { workspace = true, optional = true }
+dory_driver_redshift = { workspace = true, optional = true }
+dory_driver_clickhouse = { workspace = true, optional = true }
+dory_aws = { workspace = true, optional = true }
+dory_ssm = { workspace = true, optional = true }
+
+# MCP SDK
+rmcp = { version = "1.2.0", features = ["server", "macros", "transport-io"] }
+schemars = "1.0"
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async runtime
+tokio = { workspace = true, features = ["rt-multi-thread", "io-util", "sync", "macros"] }
+
+# Utilities
+uuid = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+rusqlite.workspace = true
+
+log.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Test support
+dory_test_support = { workspace = true }
+tempfile = "3.10"
+
+# Async test runtime
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

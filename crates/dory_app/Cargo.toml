@@ -1,0 +1,69 @@
+[package]
+name = "dory_app"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Pure domain modules for Dory (no GPUI dependency)"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+
+[dependencies]
+dory_core.workspace = true
+dory_storage.workspace = true
+dory_ssh.workspace = true
+dory_proxy.workspace = true
+dory_audit.workspace = true
+dory_ipc.workspace = true
+dory_driver_ipc.workspace = true
+dory_driver_sqlite = { workspace = true, optional = true }
+dory_driver_postgres = { workspace = true, optional = true }
+dory_driver_mysql = { workspace = true, optional = true }
+dory_driver_mongodb = { workspace = true, optional = true }
+dory_driver_redis = { workspace = true, optional = true }
+dory_driver_dynamodb = { workspace = true, optional = true }
+dory_driver_cloudwatch = { workspace = true, optional = true }
+dory_driver_influxdb = { workspace = true, optional = true }
+dory_driver_mssql = { workspace = true, optional = true }
+dory_driver_redshift = { workspace = true, optional = true }
+dory_driver_clickhouse = { workspace = true, optional = true }
+dory_driver_s3 = { workspace = true, optional = true }
+dory_portability.workspace = true
+dory_lua = { workspace = true, optional = true }
+dory_approval = { workspace = true, optional = true }
+dory_mcp = { workspace = true, optional = true }
+dory_mcp_server = { workspace = true, optional = true }
+dory_policy = { workspace = true, optional = true }
+dory_aws = { workspace = true, optional = true }
+dory_ssm = { workspace = true, optional = true }
+chrono.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+log.workspace = true
+indexmap.workspace = true
+async-trait = { workspace = true }
+
+[features]
+default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "dynamodb", "cloudwatch", "mssql"]
+# Per-driver features enable the driver crate (for registration here) and, when
+# the MCP server is compiled in, forward the matching driver feature to it. This
+# relay used to live in dory_ui; it belongs here because dory_app owns both
+# the driver crates and the optional dory_mcp_server dependency.
+sqlite = ["dory_driver_sqlite", "dory_mcp_server?/sqlite"]
+postgres = ["dory_driver_postgres", "dory_mcp_server?/postgres"]
+mysql = ["dory_driver_mysql", "dory_mcp_server?/mysql"]
+mongodb = ["dory_driver_mongodb", "dory_mcp_server?/mongodb"]
+redis = ["dory_driver_redis", "dory_mcp_server?/redis"]
+dynamodb = ["dory_driver_dynamodb", "dory_mcp_server?/dynamodb"]
+cloudwatch = ["dory_driver_cloudwatch"]
+influxdb = ["dep:dory_driver_influxdb"]
+mssql = ["dep:dory_driver_mssql"]
+redshift = ["dory_driver_redshift", "dory_mcp_server?/redshift"]
+clickhouse = ["dory_driver_clickhouse", "dory_mcp_server?/clickhouse"]
+s3 = ["dep:dory_driver_s3"]
+lua = ["dory_lua"]
+aws = ["dory_aws", "dory_ssm", "dory_mcp_server?/aws"]
+mcp = ["dory_approval", "dory_mcp", "dory_mcp_server", "dory_policy", "dory_core/mcp"]

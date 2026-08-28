@@ -1,0 +1,26 @@
+[package]
+name = "dory_proxy"
+version.workspace = true
+publish = false
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+dory_core = { path = "../dory_core" }
+dory_tunnel_core = { path = "../dory_tunnel_core" }
+log = "0.4"
+socks = "0.3"
+native-tls = "0.2"
+
+[dev-dependencies]
+testcontainers = { version = "0.27", features = ["blocking"] }
+postgres = "0.19"
+uuid.workspace = true
+env_logger.workspace = true

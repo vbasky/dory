@@ -1,0 +1,27 @@
+[package]
+name = "dory_driver_redis"
+version.workspace = true
+edition.workspace = true
+publish = false
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+dory_core.workspace = true
+dory_ssh.workspace = true
+redis = { version = "0.27", features = ["tls-rustls"] }
+serde_json.workspace = true
+urlencoding = "2"
+
+[dev-dependencies]
+dory_test_support.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,990 @@
+use dory_components::controls::{Button, ButtonVariant, Input, ReadonlyTextView};
+use dory_components::icons::AppIcon;
+use dory_components::primitives::{Icon, Text};
+use dory_components::tokens::{FontSizes, Heights, Radii, Spacing};
+use gpui::prelude::*;
+use gpui::{AnyElement, Context, IntoElement, SharedString, Window, div, px};
+use gpui_component::ActiveTheme;
+use gpui_component::scroll::ScrollableElement;
+use gpui_component::theme::Theme;
+
+use crate::query_builder::mutation_state::BuilderMode;
+
+use super::panel::QueryBuilderPanel;
+
+/// Top-level render function for `QueryBuilderPanel`.
+///
+/// Renders a sticky header (source + Save/Reset), a scrollable middle pane
+/// containing the section cards, and a sticky footer with Run / Open in
+/// Editor. State syncs that need `Window` are flushed at the top.
+pub fn render_panel(
+    panel: &mut QueryBuilderPanel,
+    window: &mut Window,
+    cx: &mut Context<QueryBuilderPanel>,
+) -> impl IntoElement {
+    if panel.pending_preview_sync {
+        panel.pending_preview_sync = false;
+        if let Some(state) = panel.sql_preview_state.clone() {
+            let text = panel.sql_preview.clone();
+            state.update(cx, |s, cx| {
+                s.set_value(&text, window, cx);
+            });
+        }
+    }
+
+    if panel.pending_join_rebuild {
+        panel.pending_join_rebuild = false;
+        panel.rebuild_join_input_states(window, cx);
+    }
+
+    if panel.pending_group_by_rebuild {
+        panel.pending_group_by_rebuild = false;
+        panel.rebuild_group_by_input_states(window, cx);
+    }
+
+    if panel.pending_filter_input_sweep {
+        panel.pending_filter_input_sweep = false;
+        panel.sweep_stale_predicate_inputs();
+    }
+
+    if panel.pending_having_input_sweep {
+        panel.pending_having_input_sweep = false;
+        panel.sweep_stale_having_predicate_inputs();
+    }
+
+    ensure_predicate_inputs(panel, window, cx);
+    ensure_having_predicate_inputs(panel, window, cx);
+    ensure_join_condition_inputs(panel, window, cx);
+
+    if panel.pending_join_condition_sweep {
+        panel.pending_join_condition_sweep = false;
+        panel.sweep_stale_join_condition_state();
+    }
+
+    if panel.pending_assign_rebuild {
+        panel.pending_assign_rebuild = false;
+        panel.rebuild_assign_inputs(window, cx);
+    }
+
+    panel.maybe_refresh_mutation_count(cx);
+
+    let theme = cx.theme().clone();
+
+    let show_mode_selector = panel.shows_mutation_selector(cx);
+
+    let container = div().flex().flex_col().size_full().bg(theme.background);
+
+    let container = match &panel.focus_handle {
+        Some(handle) => container.track_focus(handle),
+        None => container,
+    };
+
+    container
+        .child(render_header(panel, &theme, cx))
+        .when(show_mode_selector, |c| {
+            c.child(render_mode_selector(panel, &theme, cx))
+        })
+        .child(render_body(panel, &theme, cx))
+        .child(render_preview_pane(panel, &theme))
+        .child(render_footer(panel, &theme, cx))
+}
+
+// ---------------------------------------------------------------------------
+// Header
+// ---------------------------------------------------------------------------
+
+fn render_header(
+    panel: &mut QueryBuilderPanel,
+    theme: &Theme,
+    cx: &mut Context<QueryBuilderPanel>,
+) -> impl IntoElement {
+    let source_table = panel.current_spec.source.table.clone();
+    let source_schema = panel.current_spec.source.schema.clone();
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(Spacing::SM)
+        .px(Spacing::MD)
+        .h(Heights::HEADER)
+        .border_b_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .child(
+            Icon::new(AppIcon::Table)
+                .small()
+                .color(theme.muted_foreground),
+        )
+        .child(Text::label(SharedString::from(source_table)).color(theme.foreground))
+        .when_some(source_schema, |row, schema| {
+            row.child(
+                div()
+                    .px(Spacing::XS)
+                    .rounded(Radii::SM)
+                    .bg(theme.secondary)
+                    .child(Text::caption(SharedString::from(schema)).color(theme.muted_foreground)),
+            )
+        })
+        .child(div().flex_1())
+        .child(
+            Button::new(
+                "qb-hdr-save",
+                dory_i18n::t!("document.query_builder.chrome.save"),
+            )
+            .icon(AppIcon::Save)
+            .ghost()
+            .small()
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                use crate::query_builder::events::BuilderEvent;
+                let name = this.loaded_id.clone().unwrap_or_else(|| {
+                    dory_i18n::t!("document.query_builder.chrome.untitled_query")
+                });
+                cx.emit(BuilderEvent::SaveRequested { name });
+            })),
+        )
+        .child(
+            Button::new(
+                "qb-hdr-reset",
+                dory_i18n::t!("document.query_builder.chrome.reset"),
+            )
+            .icon(AppIcon::RotateCcw)
+            .ghost()
+            .small()
+            .on_click(cx.listener(|_this, _event, _window, cx| {
+                use crate::query_builder::events::BuilderEvent;
+                cx.emit(BuilderEvent::ResetRequested);
+            })),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// Mode selector (SELECT / UPDATE / DELETE) — shown only for SQL connections
+// ---------------------------------------------------------------------------
+
+fn render_mode_selector(
+    panel: &mut QueryBuilderPanel,
+    theme: &Theme,
+    cx: &mut Context<QueryBuilderPanel>,
+) -> impl IntoElement {
+    use crate::query_builder::mutation_state::BuilderMode;
+
+    let current_mode = panel
+        .mutation_state
+        .as_ref()
+        .map(|s| s.mode)
+        .unwrap_or(BuilderMode::Select);
+
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(Spacing::XS)
+        .px(Spacing::MD)
+        .py(Spacing::SM)
+        .border_b_1()
+        .border_color(theme.border)
+        .bg(theme.background);
+
+    for (mode, label) in mode_selector_options() {
+        let is_active = mode == current_mode;
+        let variant = if is_active {
+            ButtonVariant::Primary
+        } else {
+            ButtonVariant::Default
+        };
+        row = row.child(
+            Button::new(("qb-mode", mode as usize), label)
+                .variant(variant)
+                .small()
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.switch_builder_mode(mode, cx);
+                })),
+        );
+    }
+
+    row
+}
+
+/// The mode-switch bar's (mode, label) options, translated through the
+/// catalog.
+///
+/// A function rather than a `const` array because `dory_i18n::t!` is not
+/// evaluable in a const context; every arm's translated value happens to
+/// stay byte-identical between locales since these are SQL statement
+/// names, not prose.
+fn mode_selector_options() -> [(BuilderMode, String); 3] {
+    [
+        (
+            BuilderMode::Select,
+            crate::labels::builder_mode_label(BuilderMode::Select),
+        ),
+        (
+            BuilderMode::Update,
+            crate::labels::builder_mode_label(BuilderMode::Update),
+        ),
+        (
+            BuilderMode::Delete,
+            crate::labels::builder_mode_label(BuilderMode::Delete),
+        ),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Scrollable body with section cards
+// ---------------------------------------------------------------------------
+
+fn render_body(
+    panel: &mut QueryBuilderPanel,
+    theme: &Theme,
+    cx: &mut Context<QueryBuilderPanel>,
+) -> impl IntoElement {
+    use super::sections::{assignments, columns, execution, filters, group_by, joins, sort};
+
+    let current_mode = panel
+        .mutation_state
+        .as_ref()
+        .map(|s| s.mode)
+        .unwrap_or(BuilderMode::Select);
+
+    match current_mode {
+        BuilderMode::Select => {
+            let is_grouped = panel.is_grouped();
+
+            let shows_joins = panel.shows_joins_section(cx);
+            let shows_group_by = panel.shows_group_by_section(cx);
+            let shows_having = panel.shows_having_section(cx);
+            let shows_sort = panel.order_by_mode(cx) != dory_core::OrderByMode::None;
+
+            let columns_body = if is_grouped {
+                render_effective_select_preview(panel, theme).into_any_element()
+            } else {
+                columns::render_columns(panel, cx).into_any_element()
+            };
+
+            let filters_body = filters::render_filters(panel, cx).into_any_element();
+            let joins_body = shows_joins.then(|| joins::render_joins(panel, cx).into_any_element());
+            let group_by_body =
+                shows_group_by.then(|| group_by::render_group_by(panel, cx).into_any_element());
+            let sort_body = shows_sort.then(|| sort::render_sort(panel, cx).into_any_element());
+            let limit_body = render_limit_offset_body(panel).into_any_element();
+
+            let mut body = div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scrollbar()
+                .child(section_card(
+                    dory_i18n::t!("document.query_builder.section.columns"),
+                    AppIcon::Columns,
+                    theme,
+                    columns_body,
+                ))
+                .child(section_card(
+                    dory_i18n::t!("document.query_builder.section.filters"),
+                    AppIcon::ListFilter,
+                    theme,
+                    filters_body,
+                ))
+                .when_some(joins_body, |body, joins_body| {
+                    body.child(section_card("JOINS", AppIcon::Layers, theme, joins_body))
+                })
+                .when_some(group_by_body, |body, group_by_body| {
+                    body.child(section_card(
+                        "GROUP BY / AGGREGATES",
+                        AppIcon::Layers,
+                        theme,
+                        group_by_body,
+                    ))
+                });
+
+            if is_grouped && shows_having {
+                let having_body = group_by::render_having(panel, cx).into_any_element();
+                body = body.child(section_card(
+                    "HAVING",
+                    AppIcon::ListFilter,
+                    theme,
+                    having_body,
+                ));
+            }
+
+            body.when_some(sort_body, |body, sort_body| {
+                body.child(section_card(
+                    dory_i18n::t!("document.query_builder.section.sort"),
+                    AppIcon::ArrowUpDown,
+                    theme,
+                    sort_body,
+                ))
+            })
+            .child(section_card(
+                "LIMIT & OFFSET",
+                AppIcon::Hash,
+                theme,
+                limit_body,
+            ))
+            .into_any_element()
+        }
+        BuilderMode::Update => {
+            let assignments_body = assignments::render_assignments(panel, cx).into_any_element();
+            let filters_body = filters::render_filters(panel, cx).into_any_element();
+            let execution_body = execution::render_execution(panel, cx).into_any_element();
+
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scrollbar()
+                .child(section_card(
+                    "SET",
+                    AppIcon::Pencil,
+                    theme,
+                    assignments_body,
+                ))
+                .child(section_card(
+                    dory_i18n::t!("document.query_builder.section.filters_where"),
+                    AppIcon::ListFilter,
+                    theme,
+                    filters_body,
+                ))
+                .child(section_card(
+                    dory_i18n::t!("document.query_builder.section.execution"),
+                    AppIcon::Play,
+                    theme,
+                    execution_body,
+                ))
+                .into_any_element()
+        }
+        BuilderMode::Delete => {
+            let filters_body = filters::render_filters(panel, cx).into_any_element();
+            let execution_body = execution::render_execution(panel, cx).into_any_element();
+
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scrollbar()
+                .child(section_card(
+                    dory_i18n::t!("document.query_builder.section.filters_where"),
+                    AppIcon::ListFilter,
+                    theme,
+                    filters_body,
+                ))
+                .child(section_card(
+                    dory_i18n::t!("document.query_builder.section.execution"),
+                    AppIcon::Play,
+                    theme,
+                    execution_body,
+                ))
+                .into_any_element()
+        }
+    }
+}
+
+/// Renders the SQL Preview as a fixed pane between the scrollable body and
+/// the action footer, so it stays visible regardless of how many sections
+/// the user has scrolled past.
+fn render_preview_pane(panel: &mut QueryBuilderPanel, theme: &Theme) -> impl IntoElement {
+    let body = render_preview_body(panel, theme).into_any_element();
+    section_card(
+        dory_i18n::t!("document.query_builder.section.sql_preview"),
+        AppIcon::Code,
+        theme,
+        body,
+    )
+}
+
+/// Renders a section as a bordered card with an uppercase header bar and
+/// a padded body. Used for every section in the builder panel so the
+/// hierarchy stays consistent.
+fn section_card(
+    title: impl Into<SharedString>,
+    icon: AppIcon,
+    theme: &Theme,
+    body: AnyElement,
+) -> impl IntoElement {
+    let title: SharedString = title.into();
+
+    div()
+        .flex()
+        .flex_col()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(Spacing::XS)
+                .h(Heights::TOOLBAR)
+                .px(Spacing::MD)
+                .bg(theme.secondary)
+                .child(Icon::new(icon).small().color(theme.muted_foreground))
+                .child(
+                    div()
+                        .text_size(FontSizes::XS)
+                        .text_color(theme.muted_foreground)
+                        .child(title),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(Spacing::XS)
+                .px(Spacing::MD)
+                .py(Spacing::SM)
+                .child(body),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// Limit & Offset (small enough to keep inline)
+// ---------------------------------------------------------------------------
+
+fn render_limit_offset_body(panel: &mut QueryBuilderPanel) -> impl IntoElement {
+    let row = div().flex().flex_row().gap(Spacing::MD).items_center();
+
+    let limit_label = dory_i18n::t!("document.query_builder.status.limit");
+    let offset_label = dory_i18n::t!("document.query_builder.status.offset");
+
+    let row = if let Some(limit_state) = panel.limit_input_state.as_ref() {
+        row.child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(Spacing::XXS)
+                .child(Text::caption(SharedString::from(limit_label)))
+                .child(Input::new(limit_state).small().w_full()),
+        )
+    } else {
+        row.child(
+            div()
+                .flex_1()
+                .child(Text::caption(SharedString::from(limit_label))),
+        )
+    };
+
+    if let Some(offset_state) = panel.offset_input_state.as_ref() {
+        row.child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(Spacing::XXS)
+                .child(Text::caption(SharedString::from(offset_label)))
+                .child(Input::new(offset_state).small().w_full()),
+        )
+    } else {
+        row.child(
+            div()
+                .flex_1()
+                .child(Text::caption(SharedString::from(offset_label))),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Effective SELECT preview (shown when grouped, replaces editable columns)
+// ---------------------------------------------------------------------------
+
+fn render_effective_select_preview(
+    panel: &mut QueryBuilderPanel,
+    theme: &Theme,
+) -> impl IntoElement {
+    use dory_core::AggFn;
+
+    let mut container = div().flex().flex_col().gap(Spacing::XS).child(
+        Text::caption(SharedString::from(
+            "Grouped query — SELECT is managed automatically",
+        ))
+        .color(theme.muted_foreground),
+    );
+
+    for entry in &panel.current_spec.group_by {
+        let label = format!("{}.{}", entry.source_alias, entry.column);
+        container = container.child(div().text_sm().child(SharedString::from(label)));
+    }
+
+    for agg in &panel.current_spec.aggregates {
+        let fn_name = match agg.function {
+            AggFn::Count => "COUNT",
+            AggFn::CountStar => "COUNT",
+            AggFn::CountDistinct => "COUNT DISTINCT",
+            AggFn::Sum => "SUM",
+            AggFn::Avg => "AVG",
+            AggFn::Min => "MIN",
+            AggFn::Max => "MAX",
+        };
+        let col_part = if agg.function == AggFn::CountStar {
+            "*".to_string()
+        } else {
+            match (&agg.source_alias, &agg.column) {
+                (Some(sa), Some(col)) => format!("{}.{}", sa, col),
+                (None, Some(col)) => col.clone(),
+                _ => String::new(),
+            }
+        };
+        let label = format!("{}({}) AS {}", fn_name, col_part, agg.alias);
+        container = container.child(div().text_sm().child(SharedString::from(label)));
+    }
+
+    container
+}
+
+// ---------------------------------------------------------------------------
+// SQL Preview
+// ---------------------------------------------------------------------------
+
+fn render_preview_body(panel: &mut QueryBuilderPanel, theme: &Theme) -> impl IntoElement {
+    let line_count = panel.sql_preview.lines().count().max(1);
+    let status_text = crate::labels::valid_lines_label(line_count);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(Spacing::XS)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(Spacing::XS)
+                .child(
+                    Icon::new(AppIcon::CircleCheck)
+                        .small()
+                        .color(theme.muted_foreground),
+                )
+                .child(
+                    Text::caption(SharedString::from(status_text)).color(theme.muted_foreground),
+                ),
+        )
+        .when_some(panel.sql_preview_state.as_ref(), |container, state| {
+            container.child(
+                div()
+                    .rounded(Radii::SM)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(ReadonlyTextView::new(state).w_full().h(px(140.0))),
+            )
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Footer
+// ---------------------------------------------------------------------------
+
+fn render_footer(
+    panel: &mut QueryBuilderPanel,
+    theme: &Theme,
+    cx: &mut Context<QueryBuilderPanel>,
+) -> impl IntoElement {
+    let current_mode = panel
+        .mutation_state
+        .as_ref()
+        .map(|s| s.mode)
+        .unwrap_or(BuilderMode::Select);
+
+    let is_mutation_mode = current_mode.is_mutation();
+
+    let mutation_disabled = is_mutation_mode
+        && panel
+            .mutation_state
+            .as_ref()
+            .map(|s| s.is_update_with_no_assignments())
+            .unwrap_or(true);
+
+    let is_runnable = if is_mutation_mode {
+        !mutation_disabled
+    } else {
+        panel.is_runnable()
+    };
+
+    let run_label = if is_mutation_mode {
+        let has_filter = panel.current_spec.filter.is_some();
+        if current_mode == BuilderMode::Update && has_filter {
+            dory_i18n::t!("document.query_builder.status.apply_update")
+        } else {
+            dory_i18n::t!("document.query_builder.status.run")
+        }
+    } else {
+        dory_i18n::t!("document.query_builder.status.run")
+    };
+
+    let sort_error = panel.sort_validation_error.clone();
+    let incomplete_count = panel.incomplete_aggregate_row_count;
+    let is_grouped = panel.is_grouped();
+
+    div()
+        .flex()
+        .flex_col()
+        .border_t_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .when_some(sort_error, |d, error_msg| {
+            d.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::SM)
+                    .px(Spacing::MD)
+                    .py(Spacing::XS)
+                    .bg(theme.danger.opacity(0.08))
+                    .border_b_1()
+                    .border_color(theme.danger.opacity(0.3))
+                    .child(
+                        Icon::new(AppIcon::TriangleAlert)
+                            .small()
+                            .color(theme.danger),
+                    )
+                    .child(Text::caption(SharedString::from(error_msg)).color(theme.danger)),
+            )
+        })
+        .when(is_grouped && incomplete_count > 0, |d| {
+            let label = SharedString::from(crate::labels::incomplete_aggregate_rows_label(
+                incomplete_count,
+            ));
+            d.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::SM)
+                    .px(Spacing::MD)
+                    .py(Spacing::XS)
+                    .bg(theme.warning.opacity(0.08))
+                    .border_b_1()
+                    .border_color(theme.warning.opacity(0.3))
+                    .child(
+                        Icon::new(AppIcon::TriangleAlert)
+                            .small()
+                            .color(theme.warning),
+                    )
+                    .child(Text::caption(label).color(theme.warning)),
+            )
+        })
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(Spacing::SM)
+                .px(Spacing::MD)
+                .h(Heights::HEADER)
+                .child(
+                    Button::new("qb-run", run_label)
+                        .icon(AppIcon::Play)
+                        .primary()
+                        .small()
+                        .disabled(!is_runnable)
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            use crate::query_builder::events::BuilderEvent;
+                            if is_mutation_mode {
+                                if let Some(result) = this.build_mutation_spec_and_opts() {
+                                    use crate::data_grid_panel::mutation_executor::CountState;
+                                    let est_rows = this.mutation_state.as_ref().and_then(|s| {
+                                        match &s.count_state {
+                                            CountState::Done(n) => Some(*n),
+                                            _ => None,
+                                        }
+                                    });
+                                    cx.emit(BuilderEvent::MutationRunRequested {
+                                        spec: Box::new(result.0),
+                                        opts: Box::new(result.1),
+                                        est_rows,
+                                    });
+                                }
+                            } else {
+                                cx.emit(BuilderEvent::RunRequested);
+                            }
+                        })),
+                )
+                .when(!is_mutation_mode, |row| {
+                    row.child(
+                        Button::new(
+                            "qb-open-editor",
+                            dory_i18n::t!("document.query_builder.status.open_in_editor"),
+                        )
+                        .icon(AppIcon::ExternalLink)
+                        .variant(ButtonVariant::Ghost)
+                        .small()
+                        .on_click(cx.listener(
+                            |_this, _event, _window, cx| {
+                                use crate::query_builder::events::BuilderEvent;
+                                cx.emit(BuilderEvent::OpenInEditorRequested);
+                            },
+                        )),
+                    )
+                })
+                .child(div().flex_1()),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// Predicate input lifecycle
+// ---------------------------------------------------------------------------
+
+/// Walks the current filter tree and ensures every `Predicate` node has a
+/// corresponding `Entity<InputState>` in `panel.predicate_input_states`.
+///
+/// Runs every render cycle so predicates loaded from a saved query also get
+/// their input state created on first render.
+fn ensure_predicate_inputs(
+    panel: &mut QueryBuilderPanel,
+    window: &mut Window,
+    cx: &mut Context<QueryBuilderPanel>,
+) {
+    let filter = panel.current_spec.filter.clone();
+    if let Some(root) = filter {
+        ensure_in_node(panel, &root, vec![], window, cx);
+    }
+}
+
+fn ensure_in_node(
+    panel: &mut QueryBuilderPanel,
+    node: &dory_core::FilterNode,
+    path: Vec<usize>,
+    window: &mut Window,
+    cx: &mut Context<QueryBuilderPanel>,
+) {
+    use dory_core::FilterNode;
+
+    match node {
+        FilterNode::Predicate(pred) => {
+            let current_value = match &pred.value {
+                dory_core::PredicateValue::None => String::new(),
+                dory_core::PredicateValue::Single(v) => literal_to_display_string(v),
+                dory_core::PredicateValue::List(vs) => vs
+                    .iter()
+                    .map(literal_to_display_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            };
+            let column_ref = if pred.column.is_empty() {
+                String::new()
+            } else {
+                format!("{}.{}", pred.source_alias, pred.column)
+            };
+            panel.ensure_predicate_input(pred.node_id, path.clone(), &current_value, window, cx);
+            panel.ensure_predicate_column_input(
+                pred.node_id,
+                path.clone(),
+                &column_ref,
+                window,
+                cx,
+            );
+            panel.ensure_predicate_comparator_dropdown(pred.node_id, path, pred.comparator, cx);
+        }
+        FilterNode::Group { children, .. } => {
+            for (i, child) in children.iter().enumerate() {
+                let mut child_path = path.clone();
+                child_path.push(i);
+                ensure_in_node(panel, child, child_path, window, cx);
+            }
+        }
+    }
+}
+
+/// Walks the HAVING filter tree and ensures every `Predicate` node has a
+/// corresponding `Entity<InputState>` in `panel.having_predicate_*` maps.
+fn ensure_having_predicate_inputs(
+    panel: &mut QueryBuilderPanel,
+    window: &mut Window,
+    cx: &mut Context<QueryBuilderPanel>,
+) {
+    let having = panel.current_spec.having.clone();
+    if let Some(root) = having {
+        ensure_in_having_node(panel, &root, vec![], window, cx);
+    }
+}
+
+fn ensure_in_having_node(
+    panel: &mut QueryBuilderPanel,
+    node: &dory_core::FilterNode,
+    path: Vec<usize>,
+    window: &mut Window,
+    cx: &mut Context<QueryBuilderPanel>,
+) {
+    use dory_core::FilterNode;
+
+    match node {
+        FilterNode::Predicate(pred) => {
+            let current_value = match &pred.value {
+                dory_core::PredicateValue::None => String::new(),
+                dory_core::PredicateValue::Single(v) => literal_to_display_string(v),
+                dory_core::PredicateValue::List(vs) => vs
+                    .iter()
+                    .map(literal_to_display_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            };
+            let column_ref = if pred.column.is_empty() {
+                String::new()
+            } else if pred.source_alias.is_empty() {
+                pred.column.clone()
+            } else {
+                format!("{}.{}", pred.source_alias, pred.column)
+            };
+            panel.ensure_having_predicate_input(
+                pred.node_id,
+                path.clone(),
+                &current_value,
+                window,
+                cx,
+            );
+            panel.ensure_having_predicate_column_input(
+                pred.node_id,
+                path.clone(),
+                &column_ref,
+                window,
+                cx,
+            );
+            panel.ensure_having_predicate_comparator_dropdown(
+                pred.node_id,
+                path,
+                pred.comparator,
+                cx,
+            );
+        }
+        FilterNode::Group { children, .. } => {
+            for (i, child) in children.iter().enumerate() {
+                let mut child_path = path.clone();
+                child_path.push(i);
+                ensure_in_having_node(panel, child, child_path, window, cx);
+            }
+        }
+    }
+}
+
+/// Walks every join's condition tree and ensures inputs/dropdowns exist for
+/// each `JoinPredicate` leaf, regardless of nesting depth.
+fn ensure_join_condition_inputs(
+    panel: &mut QueryBuilderPanel,
+    window: &mut Window,
+    cx: &mut Context<QueryBuilderPanel>,
+) {
+    use dory_core::{JoinFilterNode, JoinOn};
+
+    fn collect(node: &JoinFilterNode, acc: &mut Vec<(u64, String, String, dory_core::Comparator)>) {
+        match node {
+            JoinFilterNode::Predicate(p) => {
+                acc.push((p.node_id, p.left.clone(), p.right.clone(), p.op));
+            }
+            JoinFilterNode::Group { children, .. } => {
+                for child in children {
+                    collect(child, acc);
+                }
+            }
+        }
+    }
+
+    let mut snapshot = Vec::new();
+    for join in &panel.current_spec.joins {
+        if let JoinOn::Conditions(root) = &join.on {
+            collect(root, &mut snapshot);
+        }
+    }
+
+    for (node_id, left, right, op) in snapshot {
+        panel.ensure_join_condition_state(node_id, &left, &right, op, window, cx);
+    }
+}
+
+fn literal_to_display_string(v: &dory_core::LiteralValue) -> String {
+    use dory_core::LiteralValue;
+    match v {
+        LiteralValue::Text(s) => s.clone(),
+        LiteralValue::Integer(n) => n.to_string(),
+        LiteralValue::Float(f) => f.to_string(),
+        LiteralValue::Bool(b) => b.to_string(),
+        LiteralValue::Timestamp(t) => t.clone(),
+        LiteralValue::Null => "NULL".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mode_selector_options;
+    use crate::query_builder::mutation_state::BuilderMode;
+
+    #[test]
+    fn mode_selector_options_returns_translated_labels_for_every_mode() {
+        let options = mode_selector_options();
+
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0].0, BuilderMode::Select);
+        assert_eq!(options[0].1, "SELECT");
+        assert_eq!(options[1].0, BuilderMode::Update);
+        assert_eq!(options[1].1, "UPDATE");
+        assert_eq!(options[2].0, BuilderMode::Delete);
+        assert_eq!(options[2].1, "DELETE");
+    }
+
+    #[test]
+    fn query_builder_section_keys_resolve_in_both_locales() {
+        let keys = [
+            "document.query_builder.section.columns",
+            "document.query_builder.section.filters",
+            "document.query_builder.section.filters_where",
+            "document.query_builder.section.sort",
+            "document.query_builder.section.execution",
+            "document.query_builder.section.sql_preview",
+        ];
+
+        for key in keys {
+            for locale in ["en", "es"] {
+                let value = dory_i18n::t!(key, locale = locale);
+
+                assert!(!value.is_empty(), "{key} resolved empty in {locale}");
+                assert_ne!(value, key, "{key} resolved to its own key in {locale}");
+                assert_ne!(
+                    value,
+                    format!("{locale}.{key}"),
+                    "{key} missing from {locale} catalog"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn query_builder_section_columns_differs_between_locales() {
+        let en = dory_i18n::t!("document.query_builder.section.columns", locale = "en");
+        let es = dory_i18n::t!("document.query_builder.section.columns", locale = "es");
+
+        assert_eq!(en, "COLUMNS");
+        assert_eq!(es, "COLUMNAS");
+        assert_ne!(en, es);
+    }
+
+    #[test]
+    fn query_builder_sql_clause_headers_stay_literal_in_source() {
+        let full_source = include_str!("view.rs");
+        let source = full_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("view.rs must contain the render code above the test module");
+
+        for literal_header in [
+            "\"JOINS\"",
+            "\"GROUP BY / AGGREGATES\"",
+            "\"HAVING\"",
+            "\"LIMIT & OFFSET\"",
+            "\"SET\"",
+        ] {
+            assert!(
+                source.contains(literal_header),
+                "expected SQL clause header literal {literal_header:?} in view.rs source"
+            );
+        }
+
+        for translated_header in [
+            "\"COLUMNS\"",
+            "\"FILTERS\",",
+            "\"FILTERS (WHERE)\"",
+            "\"SORT\"",
+            "\"EXECUTION\"",
+            "\"SQL PREVIEW\"",
+        ] {
+            assert!(
+                !source.contains(translated_header),
+                "general header literal {translated_header:?} must be replaced with a t! call"
+            );
+        }
+    }
+}

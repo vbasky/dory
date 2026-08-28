@@ -1,0 +1,32 @@
+{
+  version = "0.7.6";
+
+  # SHA256 SRI hashes of each prebuilt artifact published in the matching
+  # GitHub Release. This file is a per-branch channel pointer: on `main` it
+  # tracks the newest published rc or stable tag; on a release/vX.Y branch it
+  # tracks that line's newest tag (-rc.N, then vX.Y.0, then patches). The
+  # rolling nightly channel is separate (see nix/nightly-info.nix). See
+  # docs/RELEASE.md.
+  #
+  # To refresh after a new release:
+  #
+  #   ver=X.Y.Z[-rc.N]
+  #   for arch in amd64 arm64; do
+  #     curl -fsSL -o /tmp/dory-$arch.tar.gz \
+  #       "https://github.com/vbasky/dory/releases/download/v$ver/dory-linux-$arch.tar.gz"
+  #     nix-hash --to-sri --type sha256 \
+  #       "$(sha256sum /tmp/dory-$arch.tar.gz | cut -d' ' -f1)"
+  #   done
+  #
+  # Then update `version`, the two `url`s, and the two `hash`es below.
+  artifacts = {
+    "x86_64-linux" = {
+      url = "https://github.com/vbasky/dory/releases/download/v0.7.6/dory-linux-amd64.tar.gz";
+      hash = "sha256-D5apBzfzFa/jujKhvZ+kDkLrIaUZ3QbHmaYymHRyj3Y=";
+    };
+    "aarch64-linux" = {
+      url = "https://github.com/vbasky/dory/releases/download/v0.7.6/dory-linux-arm64.tar.gz";
+      hash = "sha256-rm+LgsDHogA/bPnfeVhBcpjrI8HGWJw3l1V8EhLjl1I=";
+    };
+  };
+}

@@ -1,0 +1,738 @@
+use super::*;
+use dory_core::TaskKind;
+use dory_ui_base::AsyncUpdateResultExt;
+use dory_ui_base::user_error::{ErrorKind, UserFacingError, report_error};
+
+const COLLECTION_CHILDREN_PAGE_SIZE: u32 = 50;
+
+impl Sidebar {
+    pub(super) fn find_table_for_item<'a>(
+        parts: &ItemIdParts,
+        schema: &'a Option<SchemaSnapshot>,
+    ) -> Option<&'a TableInfo> {
+        let schema = schema.as_ref()?;
+
+        for db_schema in schema.schemas() {
+            if db_schema.name == parts.schema_name {
+                return db_schema
+                    .tables
+                    .iter()
+                    .find(|t| t.name == parts.object_name);
+            }
+        }
+
+        // For databases without schemas (fallback)
+        schema.tables().iter().find(|t| t.name == parts.object_name)
+    }
+
+    pub(super) fn find_view_for_item<'a>(
+        parts: &ItemIdParts,
+        schema: &'a Option<SchemaSnapshot>,
+    ) -> Option<&'a ViewInfo> {
+        let schema = schema.as_ref()?;
+
+        for db_schema in schema.schemas() {
+            if db_schema.name == parts.schema_name {
+                return db_schema.views.iter().find(|v| v.name == parts.object_name);
+            }
+        }
+
+        // For databases without schemas (fallback)
+        schema.views().iter().find(|v| v.name == parts.object_name)
+    }
+
+    /// Check if a table has detailed schema (columns/indexes) loaded.
+    /// If not, spawns a background task to fetch them and returns `Loading`.
+    pub(super) fn ensure_table_details(
+        &mut self,
+        item_id: &str,
+        pending_action: PendingAction,
+        cx: &mut Context<Self>,
+    ) -> TableDetailsStatus {
+        if self.loading_items.contains(item_id) {
+            return TableDetailsStatus::Loading;
+        }
+
+        let Some(parts) = parse_node_id(item_id)
+            .as_ref()
+            .and_then(ItemIdParts::from_node_id)
+        else {
+            return TableDetailsStatus::NotFound;
+        };
+
+        let state = self.app_state.read(cx);
+        let Some(conn) = state.connections().get(&parts.profile_id) else {
+            return TableDetailsStatus::NotFound;
+        };
+
+        let cache_db = parts.cache_database();
+        let cache_key = (
+            cache_db.to_string(),
+            Some(parts.schema_name.clone()),
+            parts.object_name.clone(),
+        );
+
+        if let Some(details) = conn.table_details.get(&cache_key)
+            && (details.columns.is_some() || details.sample_fields.is_some())
+        {
+            return TableDetailsStatus::Ready;
+        }
+
+        if let Some(db_schema) = conn.database_schemas.get(&parts.schema_name)
+            && let Some(table) = db_schema
+                .tables
+                .iter()
+                .find(|t| t.name == parts.object_name)
+            && (table.columns.is_some() || table.sample_fields.is_some())
+        {
+            return TableDetailsStatus::Ready;
+        }
+
+        let target_schema = parts
+            .database
+            .as_deref()
+            .and_then(|db| conn.database_connections.get(db))
+            .and_then(|dc| dc.schema.as_ref())
+            .or(conn.schema.as_ref());
+
+        if let Some(schema) = target_schema {
+            for db_schema in schema.schemas() {
+                if db_schema.name == parts.schema_name
+                    && let Some(table) = db_schema
+                        .tables
+                        .iter()
+                        .find(|t| t.name == parts.object_name)
+                    && (table.columns.is_some() || table.sample_fields.is_some())
+                {
+                    return TableDetailsStatus::Ready;
+                }
+            }
+        }
+
+        if self.spawn_fetch_table_details(&parts, pending_action, cx) {
+            TableDetailsStatus::Loading
+        } else {
+            TableDetailsStatus::NotFound
+        }
+    }
+
+    pub(super) fn ensure_collection_children(
+        &mut self,
+        profile_id: Uuid,
+        database: &str,
+        collection: &str,
+        pending_action: PendingAction,
+        cx: &mut Context<Self>,
+    ) -> TableDetailsStatus {
+        let item_id = pending_action.item_id().to_string();
+
+        if self.loading_items.contains(&item_id) {
+            return TableDetailsStatus::Loading;
+        }
+
+        let has_any_page = self
+            .app_state
+            .read(cx)
+            .connections()
+            .get(&profile_id)
+            .is_some_and(|connection| {
+                connection
+                    .collection_children
+                    .contains_key(&(database.to_string(), collection.to_string()))
+            });
+
+        if has_any_page {
+            return TableDetailsStatus::Ready;
+        }
+
+        if self.spawn_fetch_collection_children(
+            profile_id,
+            database,
+            collection,
+            pending_action,
+            cx,
+        ) {
+            TableDetailsStatus::Loading
+        } else {
+            TableDetailsStatus::NotFound
+        }
+    }
+
+    pub(super) fn spawn_fetch_collection_children(
+        &mut self,
+        profile_id: Uuid,
+        database: &str,
+        collection: &str,
+        pending_action: PendingAction,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.loading_items.contains(pending_action.item_id()) {
+            return true;
+        }
+
+        let params = match self.app_state.read(cx).prepare_fetch_collection_children(
+            profile_id,
+            database,
+            collection,
+            COLLECTION_CHILDREN_PAGE_SIZE,
+        ) {
+            Ok(params) => params,
+            Err(error) => {
+                if error != "Collection children already fully cached" {
+                    log::warn!("Cannot fetch collection children: {}", error);
+                    self.pending_toast = Some(PendingToast {
+                        message: crate::labels::collection_load_failed_label(collection, &error),
+                        is_error: true,
+                    });
+                    cx.notify();
+                }
+
+                return false;
+            }
+        };
+
+        let database_name = database.to_string();
+        let task_description = crate::labels::loading_event_streams_task_label(collection);
+        let load_task_id = self.app_state.update(cx, |state, _| {
+            let (task_id, _) = state.start_task_for_profile(
+                TaskKind::LoadSchema,
+                task_description,
+                Some(profile_id),
+            );
+            task_id
+        });
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { params.execute() });
+
+        let collection_name = collection.to_string();
+
+        self.spawn_fetch_with_result(
+            pending_action,
+            Some(load_task_id),
+            task,
+            "Failed to fetch collection children",
+            move |error| crate::labels::collection_load_failed_label(&collection_name, error),
+            |app_state, res, cx| {
+                app_state.update(cx, |state, cx| {
+                    state.set_collection_children_page(
+                        res.profile_id,
+                        res.database,
+                        res.collection,
+                        res.page,
+                    );
+                    cx.emit(AppStateChanged);
+                });
+            },
+            move |app_state, cx| {
+                app_state.update(cx, |state, state_cx| {
+                    state.finish_pending_operation(profile_id, Some(&database_name));
+                    state_cx.emit(AppStateChanged);
+                });
+            },
+            cx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_fetch_with_result<R, F, G, M>(
+        &mut self,
+        pending_action: PendingAction,
+        task_id: Option<TaskId>,
+        task: Task<Result<R, String>>,
+        error_log_prefix: &'static str,
+        toast_message: M,
+        on_success: F,
+        on_finalize: G,
+        cx: &mut Context<Self>,
+    ) -> bool
+    where
+        R: Send + 'static,
+        F: Fn(&Entity<dory_ui_base::app_state_entity::AppStateEntity>, R, &mut App)
+            + Send
+            + 'static,
+        G: Fn(&Entity<dory_ui_base::app_state_entity::AppStateEntity>, &mut App) + Send + 'static,
+        M: Fn(&str) -> String + Send + 'static,
+    {
+        let item_id = pending_action.item_id().to_string();
+        self.pending_actions.insert(item_id.clone(), pending_action);
+        self.loading_items.insert(item_id.clone());
+
+        let app_state = self.app_state.clone();
+        let sidebar = cx.entity().clone();
+
+        cx.spawn(async move |_this, cx| {
+            let result = task.await;
+
+            cx.update(|cx| {
+                match result {
+                    Ok(res) => {
+                        on_success(&app_state, res, cx);
+
+                        if let Some(task_id) = task_id {
+                            app_state.update(cx, |state, _| {
+                                state.complete_task(task_id);
+                            });
+                        }
+
+                        sidebar.update(cx, |sidebar, cx| {
+                            sidebar.loading_items.remove(&item_id);
+                            sidebar.complete_pending_action(&item_id, cx);
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("{}: {}", error_log_prefix, e);
+
+                        let message = toast_message(&e);
+
+                        if let Some(task_id) = task_id {
+                            app_state.update(cx, |state, _| {
+                                state.fail_task_with_details(task_id, e.clone(), message.clone());
+                            });
+                        }
+
+                        sidebar.update(cx, |sidebar, cx| {
+                            sidebar.loading_items.remove(&item_id);
+                            sidebar.pending_actions.remove(&item_id);
+                            sidebar.expansion_overrides.remove(&item_id);
+                            sidebar.pending_toast = Some(PendingToast {
+                                message,
+                                is_error: true,
+                            });
+                            sidebar.rebuild_tree_with_overrides(cx);
+                        });
+                    }
+                }
+
+                on_finalize(&app_state, cx);
+            })
+            .log_if_dropped();
+        })
+        .detach();
+
+        true
+    }
+
+    /// Returns `true` if the fetch was started, `false` if preparation failed.
+    fn spawn_fetch_table_details(
+        &mut self,
+        parts: &ItemIdParts,
+        pending_action: PendingAction,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let cache_db = parts.cache_database().to_string();
+
+        let params = match self.app_state.read(cx).prepare_fetch_table_details(
+            parts.profile_id,
+            &cache_db,
+            Some(&parts.schema_name),
+            &parts.object_name,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                if e != "Table details already cached" {
+                    log::warn!("Cannot fetch table details: {}", e);
+                    self.pending_toast = Some(PendingToast {
+                        message: crate::labels::table_load_failed_label(&parts.object_name, &e),
+                        is_error: true,
+                    });
+                    cx.notify();
+                }
+                return false;
+            }
+        };
+
+        let profile_id = parts.profile_id;
+        let db_name = cache_db.clone();
+        let load_task_id = self.app_state.update(cx, |state, _| {
+            let (task_id, _) = state.start_task_for_profile(
+                TaskKind::LoadSchema,
+                crate::labels::loading_event_streams_task_label(&parts.object_name),
+                Some(parts.profile_id),
+            );
+            task_id
+        });
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { params.execute().map_err(|e| e.to_string()) });
+
+        let table_name = parts.object_name.clone();
+
+        self.spawn_fetch_with_result(
+            pending_action,
+            Some(load_task_id),
+            task,
+            "Failed to fetch table details",
+            move |error| crate::labels::table_load_failed_label(&table_name, error),
+            |app_state, res, cx| {
+                app_state.update(cx, |state, cx| {
+                    state.set_table_details(
+                        res.profile_id,
+                        res.database.clone(),
+                        res.schema.clone(),
+                        res.table.clone(),
+                        res.details,
+                    );
+                    state.set_dependents(
+                        res.profile_id,
+                        res.database,
+                        res.schema,
+                        res.table,
+                        res.dependents,
+                    );
+                    cx.emit(AppStateChanged);
+                });
+            },
+            move |app_state, cx| {
+                app_state.update(cx, |state, state_cx| {
+                    state.finish_pending_operation(profile_id, Some(&db_name));
+                    state_cx.emit(AppStateChanged);
+                });
+            },
+            cx,
+        )
+    }
+
+    /// Returns `true` if the fetch was started, `false` if preparation failed.
+    pub(super) fn spawn_fetch_schema_types(
+        &mut self,
+        profile_id: Uuid,
+        database: &str,
+        schema: Option<&str>,
+        pending_action: PendingAction,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let params = match self
+            .app_state
+            .read(cx)
+            .prepare_fetch_schema_types(profile_id, database, schema)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                if e != "Schema types already cached" {
+                    report_error(
+                        UserFacingError::new(
+                            ErrorKind::Network,
+                            crate::labels::cannot_load_schema_types_label(),
+                        )
+                        .with_cause(e),
+                        cx,
+                    );
+                }
+                return false;
+            }
+        };
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { params.execute() });
+
+        self.spawn_fetch_with_result(
+            pending_action,
+            None,
+            task,
+            "Failed to fetch schema types",
+            crate::labels::data_types_load_failed_label,
+            |app_state, res, cx| {
+                app_state.update(cx, |state, cx| {
+                    state.set_schema_types(res.profile_id, res.database, res.schema, res.types);
+                    cx.emit(AppStateChanged);
+                });
+            },
+            |_app_state, _cx| {},
+            cx,
+        )
+    }
+
+    /// Returns `true` if the fetch was started, `false` if preparation failed.
+    pub(super) fn spawn_fetch_schema_indexes(
+        &mut self,
+        profile_id: Uuid,
+        database: &str,
+        schema: Option<&str>,
+        pending_action: PendingAction,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let params = match self
+            .app_state
+            .read(cx)
+            .prepare_fetch_schema_indexes(profile_id, database, schema)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                if e != "Schema indexes already cached" {
+                    report_error(
+                        UserFacingError::new(
+                            ErrorKind::Network,
+                            crate::labels::cannot_load_schema_indexes_label(),
+                        )
+                        .with_cause(e),
+                        cx,
+                    );
+                }
+                return false;
+            }
+        };
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { params.execute() });
+
+        self.spawn_fetch_with_result(
+            pending_action,
+            None,
+            task,
+            "Failed to fetch schema indexes",
+            crate::labels::indexes_load_failed_label,
+            |app_state, res, cx| {
+                app_state.update(cx, |state, cx| {
+                    state.set_schema_indexes(res.profile_id, res.database, res.schema, res.indexes);
+                    cx.emit(AppStateChanged);
+                });
+            },
+            |_app_state, _cx| {},
+            cx,
+        )
+    }
+
+    /// Returns `true` if the fetch was started, `false` if preparation failed.
+    pub(super) fn spawn_fetch_schema_foreign_keys(
+        &mut self,
+        profile_id: Uuid,
+        database: &str,
+        schema: Option<&str>,
+        pending_action: PendingAction,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let params = match self
+            .app_state
+            .read(cx)
+            .prepare_fetch_schema_foreign_keys(profile_id, database, schema)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                if e != "Schema foreign keys already cached" {
+                    report_error(
+                        UserFacingError::new(
+                            ErrorKind::Network,
+                            crate::labels::cannot_load_schema_foreign_keys_label(),
+                        )
+                        .with_cause(e),
+                        cx,
+                    );
+                }
+                return false;
+            }
+        };
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { params.execute() });
+
+        self.spawn_fetch_with_result(
+            pending_action,
+            None,
+            task,
+            "Failed to fetch schema foreign keys",
+            crate::labels::foreign_keys_load_failed_label,
+            |app_state, res, cx| {
+                app_state.update(cx, |state, cx| {
+                    state.set_schema_foreign_keys(
+                        res.profile_id,
+                        res.database,
+                        res.schema,
+                        res.foreign_keys,
+                    );
+                    cx.emit(AppStateChanged);
+                });
+            },
+            |_app_state, _cx| {},
+            cx,
+        )
+    }
+
+    pub(super) fn spawn_fetch_schema_routines(
+        &mut self,
+        profile_id: Uuid,
+        database: &str,
+        schema: Option<&str>,
+        pending_action: PendingAction,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let params = match self
+            .app_state
+            .read(cx)
+            .prepare_fetch_schema_routines(profile_id, database, schema)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                if e != "Schema routines already cached" {
+                    report_error(
+                        UserFacingError::new(
+                            ErrorKind::Network,
+                            crate::labels::cannot_load_schema_routines_label(),
+                        )
+                        .with_cause(e),
+                        cx,
+                    );
+                }
+                return false;
+            }
+        };
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { params.execute() });
+
+        self.spawn_fetch_with_result(
+            pending_action,
+            None,
+            task,
+            "Failed to fetch schema routines",
+            crate::labels::routines_load_failed_label,
+            |app_state, res, cx| {
+                app_state.update(cx, |state, cx| {
+                    state.set_schema_routines(
+                        res.profile_id,
+                        res.database,
+                        res.schema,
+                        res.routines,
+                    );
+                    cx.emit(AppStateChanged);
+                });
+            },
+            |_app_state, _cx| {},
+            cx,
+        )
+    }
+
+    /// Execute the stored action for a completed fetch.
+    pub(super) fn complete_pending_action(&mut self, item_id: &str, cx: &mut Context<Self>) {
+        let Some(action) = self.pending_actions.remove(item_id) else {
+            return;
+        };
+
+        match action {
+            PendingAction::ViewSchema { item_id } => {
+                self.view_table_schema(&item_id, cx);
+            }
+            PendingAction::GenerateCode {
+                item_id,
+                generator_id,
+            } => {
+                self.generate_code_impl(&item_id, &generator_id, cx);
+            }
+            PendingAction::ExpandTypesFolder { item_id }
+            | PendingAction::ExpandSchemaIndexesFolder { item_id }
+            | PendingAction::ExpandSchemaForeignKeysFolder { item_id }
+            | PendingAction::ExpandSchemaRoutinesFolder { item_id }
+            | PendingAction::ExpandCollection { item_id } => {
+                self.expand_schema_folder(&item_id, cx);
+            }
+            PendingAction::OpenChildPicker { item_id } => {
+                self.pending_child_picker_item = Some(item_id);
+            }
+        }
+    }
+
+    pub(super) fn expand_schema_folder(&mut self, item_id: &str, cx: &mut Context<Self>) {
+        self.expansion_overrides.insert(item_id.to_string(), true);
+        self.rebuild_tree_with_overrides(cx);
+    }
+
+    pub(super) fn refresh_schema_if_tables_empty(
+        &mut self,
+        profile_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connected) = self.app_state.read(cx).connections().get(&profile_id) else {
+            return;
+        };
+
+        let snapshot_has_tables = |snapshot: &SchemaSnapshot| {
+            snapshot
+                .schemas()
+                .iter()
+                .any(|schema| !schema.tables.is_empty())
+        };
+
+        if connected.schema.as_ref().is_some_and(snapshot_has_tables)
+            || connected
+                .database_connections
+                .values()
+                .filter_map(|database_connection| database_connection.schema.as_ref())
+                .any(snapshot_has_tables)
+        {
+            return;
+        }
+
+        let Some(connection) = self
+            .app_state
+            .read(cx)
+            .connections()
+            .get(&profile_id)
+            .map(|connected| connected.connection.clone())
+        else {
+            return;
+        };
+
+        let loading_key = format!("schema-refresh|{profile_id}");
+        if self.loading_items.contains(&loading_key) {
+            return;
+        }
+        self.loading_items.insert(loading_key.clone());
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { connection.schema() });
+        let app_state = self.app_state.clone();
+        let sidebar = cx.entity().clone();
+
+        cx.spawn(async move |_this, cx| {
+            let result = task.await;
+            if let Err(error) = cx.update(|cx| {
+                sidebar.update(cx, |sidebar, _cx| {
+                    sidebar.loading_items.remove(&loading_key);
+                });
+                match result {
+                    Ok(schema) => {
+                        app_state.update(cx, |state, cx| {
+                            if let Some(connected) = state.connections_mut().get_mut(&profile_id) {
+                                let current = schema
+                                    .current_database()
+                                    .map(str::to_string)
+                                    .or_else(|| connected.active_database.clone());
+                                if let Some(database) = current.as_deref()
+                                    && let Some(database_connection) =
+                                        connected.database_connections.get_mut(database)
+                                {
+                                    database_connection.schema = Some(schema.clone());
+                                }
+                                connected.schema = Some(schema);
+                            }
+                            cx.emit(AppStateChanged);
+                        });
+                        sidebar.update(cx, |sidebar, cx| {
+                            sidebar.refresh_tree(cx);
+                        });
+                    }
+                    Err(error) => {
+                        report_error(
+                            UserFacingError::new(
+                                ErrorKind::Driver,
+                                crate::labels::load_schema_failed_label(&error.to_string()),
+                            )
+                            .with_cause(error.to_string()),
+                            cx,
+                        );
+                    }
+                }
+            }) {
+                log::warn!("Failed to apply schema table refresh: {error:?}");
+            }
+        })
+        .detach();
+    }
+}

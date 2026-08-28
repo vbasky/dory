@@ -1,0 +1,298 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g., v0.7.0 or v0.7.0-rc.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Tests
+    uses: ./.github/workflows/tests.yml
+
+  style:
+    name: Style
+    uses: ./.github/workflows/style.yml
+
+  classify:
+    name: Classify release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      channel: ${{ steps.classify.outputs.channel }}
+      draft: ${{ steps.classify.outputs.draft }}
+      prerelease: ${{ steps.classify.outputs.prerelease }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="$DISPATCH_VERSION"
+          else
+            RAW="${GITHUB_REF_NAME}"
+          fi
+          echo "version=${RAW#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Classify channel
+        id: classify
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "channel=stable"    >> "$GITHUB_OUTPUT"
+            echo "draft=false"       >> "$GITHUB_OUTPUT"
+            echo "prerelease=false"  >> "$GITHUB_OUTPUT"
+          elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+            echo "channel=rc"        >> "$GITHUB_OUTPUT"
+            echo "draft=false"       >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"   >> "$GITHUB_OUTPUT"
+          elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$ ]]; then
+            # -dev.N is deprecated; kept for back-compat until old tags are gone.
+            echo "channel=rc"        >> "$GITHUB_OUTPUT"
+            echo "draft=false"       >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"   >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=stable"    >> "$GITHUB_OUTPUT"
+            echo "draft=true"        >> "$GITHUB_OUTPUT"
+            echo "prerelease=false"  >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Enforce release-branch ancestry
+        # docs/RELEASE.md requires rc/stable tags to originate from a
+        # release/vX.Y branch; tagging from main is an anti-pattern. The classify
+        # steps above key only off the tag name, so an accidental tag pushed from
+        # main would otherwise publish a full release. Verify the built commit is
+        # an ancestor of the matching release branch and fail loudly otherwise.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CHANNEL: ${{ steps.classify.outputs.channel }}
+        run: |
+          MINOR="$(echo "$VERSION" | cut -d. -f1,2)"
+          BRANCH="release/v${MINOR}"
+
+          if ! git fetch --quiet origin "$BRANCH" 2>/dev/null; then
+            echo "::error::Release branch '$BRANCH' does not exist on origin. A $CHANNEL release must be cut from its release branch (see docs/RELEASE.md)."
+            exit 1
+          fi
+
+          if git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "Commit $GITHUB_SHA is an ancestor of $BRANCH — ancestry OK."
+          else
+            echo "::error::Commit $GITHUB_SHA is not an ancestor of '$BRANCH'. Refusing to publish a $CHANNEL release tagged outside its release branch (see docs/RELEASE.md)."
+            exit 1
+          fi
+
+  build:
+    name: Build
+    needs: [tests, style, classify]
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.classify.outputs.version }}
+      channel: ${{ needs.classify.outputs.channel }}
+      prerelease: ${{ needs.classify.outputs.prerelease == 'true' }}
+    secrets: inherit
+
+  release:
+    name: Create Release
+    needs: [classify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write      # OIDC token for build-provenance attestation
+      attestations: write  # write the provenance attestation
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        if: env.ACT != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: artifacts
+          pattern: "*"
+          merge-multiple: false
+
+      - name: (act) Load artifacts locally
+        if: env.ACT == 'true'
+        run: |
+          mkdir -p artifacts
+          cp -r /tmp/artifacts/* artifacts/
+          ls -R artifacts
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b  # v2
+        with:
+          tool: git-cliff
+          version: 2.13.1
+
+      - name: Generate changelog for release body
+        id: cliff
+        env:
+          RAW_VERSION: ${{ needs.classify.outputs.version }}
+          CHANNEL: ${{ needs.classify.outputs.channel }}
+        run: |
+          VERSION="v${RAW_VERSION}"
+
+          # A git-cliff failure must not silently produce empty release notes
+          # (e.g. a cliff.toml regression). Surface it as a warning and fall back
+          # to a placeholder below, but never swallow it entirely.
+          if [ "$CHANNEL" = "stable" ]; then
+            # Stable notes must cover exactly "what is new since the previous
+            # stable release". --current cannot express that here: a stable tag
+            # lives only on its own release branch, so it is not an ancestor of
+            # the next release branch, and --current would walk back to the last
+            # *reachable* tag (a -dev.N or the branch point) and re-announce
+            # everything that already shipped.
+            #
+            # Take the range from the previous stable tag explicitly, then drop
+            # the commits that reached it via cherry-pick: those have different
+            # SHAs on this branch but the same patch, and --cherry-pick matches
+            # them by patch id.
+            PREV_STABLE="$(git tag --list 'v*' --sort=-v:refname \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | grep -vFx "$VERSION" \
+              | head -n1)"
+
+            if [ -n "$PREV_STABLE" ]; then
+              SKIP_ARGS=()
+              while read -r sha; do
+                [ -n "$sha" ] && SKIP_ARGS+=(--skip-commit "$sha")
+              done < <(comm -23 \
+                <(git log --format=%H "${PREV_STABLE}..HEAD" | sort) \
+                <(git log --cherry-pick --right-only --format=%H "${PREV_STABLE}...HEAD" | sort))
+
+              echo "prev_stable=${PREV_STABLE}" >> "$GITHUB_OUTPUT"
+              echo "Generating notes for ${PREV_STABLE}..${VERSION}, skipping ${#SKIP_ARGS[@]} already-released commits."
+
+              # The range must precede --skip-commit: it takes multiple values
+              # and would otherwise swallow the positional argument.
+              git-cliff --config cliff.toml "${PREV_STABLE}..HEAD" --tag "$VERSION" \
+                --strip header \
+                "${SKIP_ARGS[@]}" \
+                -o cliff_notes.md \
+                || echo "::warning::git-cliff failed to generate release notes; the release body may be incomplete."
+            else
+              # First stable release: there is no previous stable tag to bound the range.
+              git-cliff --config cliff.toml --current --tag "$VERSION" \
+                --strip header \
+                -o cliff_notes.md \
+                || echo "::warning::git-cliff failed to generate release notes; the release body may be incomplete."
+            fi
+          else
+            # RC / pre-release: unreleased range since last stable tag.
+            git-cliff --config cliff.toml --unreleased --tag "$VERSION" \
+              --strip header \
+              -o cliff_notes.md \
+              || echo "::warning::git-cliff failed to generate release notes; the release body may be incomplete."
+          fi
+
+          if [ ! -s cliff_notes.md ]; then
+            echo "No conventional-commit entries found for this range." > cliff_notes.md
+          fi
+
+      - name: Compose release body
+        env:
+          RAW_VERSION: ${{ needs.classify.outputs.version }}
+          CHANNEL: ${{ needs.classify.outputs.channel }}
+        run: |
+          VERSION="v${RAW_VERSION}"
+          REPO="${{ github.repository }}"
+
+          : > release_body.md
+
+          if [ "$CHANNEL" = "nightly" ]; then
+            printf '> **Nightly build** — built automatically from `main` HEAD. Not recommended for production use.\n\n' >> release_body.md
+          fi
+
+          # git-cliff generated notes
+          if [ -s cliff_notes.md ]; then
+            cat cliff_notes.md >> release_body.md
+            echo "" >> release_body.md
+          fi
+
+          # Installation instructions template
+          sed -e "s|__VERSION__|${VERSION}|g" -e "s|__REPO__|${REPO}|g" \
+            .github/release-template.md >> release_body.md
+
+          # Full changelog link. On stable, compare against the previous stable
+          # tag rather than the last reachable one, matching the notes range.
+          PREV_TAG="${{ steps.cliff.outputs.prev_stable }}"
+          if [ -z "$PREV_TAG" ]; then
+            PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          fi
+          if [ -n "$PREV_TAG" ]; then
+            echo "" >> release_body.md
+            echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREV_TAG}...${VERSION}" >> release_body.md
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
+        with:
+          tag_name: v${{ needs.classify.outputs.version }}
+          name: Dory v${{ needs.classify.outputs.version }}
+          body_path: release_body.md
+          files: |
+            artifacts/linux-*/*.tar.gz
+            artifacts/linux-*/*.tar.gz.sha256
+            artifacts/linux-*/*.tar.gz.asc
+            artifacts/linux-*/*.AppImage
+            artifacts/linux-*/*.AppImage.sha256
+            artifacts/linux-*/*.AppImage.asc
+            artifacts/linux-*/*.deb
+            artifacts/linux-*/*.deb.sha256
+            artifacts/linux-*/*.deb.asc
+            artifacts/linux-*/*.rpm
+            artifacts/linux-*/*.rpm.sha256
+            artifacts/linux-*/*.rpm.asc
+            artifacts/macos-*/*.dmg
+            artifacts/macos-*/*.dmg.sha256
+            artifacts/macos-*/*.dmg.asc
+            artifacts/windows-*/*.zip
+            artifacts/windows-*/*.zip.sha256
+            artifacts/windows-*/*.zip.asc
+            artifacts/windows-*/*-setup.exe
+            artifacts/windows-*/*-setup.exe.sha256
+            artifacts/windows-*/*-setup.exe.asc
+          draft: ${{ needs.classify.outputs.draft == 'true' }}
+          prerelease: ${{ needs.classify.outputs.prerelease == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest build provenance
+        if: env.ACT != 'true'
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
+        with:
+          subject-path: |
+            artifacts/linux-*/*.tar.gz
+            artifacts/linux-*/*.AppImage
+            artifacts/linux-*/*.deb
+            artifacts/linux-*/*.rpm
+            artifacts/macos-*/*.dmg
+            artifacts/windows-*/*.zip
+            artifacts/windows-*/*-setup.exe

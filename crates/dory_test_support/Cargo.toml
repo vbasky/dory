@@ -1,0 +1,30 @@
+[package]
+name = "dory_test_support"
+version.workspace = true
+edition.workspace = true
+publish = false
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+dory_core.workspace = true
+dory_ipc.workspace = true
+dory_driver_cloudwatch.workspace = true
+dory_driver_dynamodb.workspace = true
+dory_driver_influxdb.workspace = true
+dory_driver_mongodb.workspace = true
+dory_driver_mssql.workspace = true
+dory_driver_mysql.workspace = true
+dory_driver_postgres.workspace = true
+dory_driver_redis.workspace = true
+dory_driver_redshift.workspace = true
+dory_driver_sqlite.workspace = true
+testcontainers = { version = "0.27", features = ["blocking"] }
+interprocess.workspace = true
+reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-tls"] }

@@ -1,0 +1,678 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version string without leading v (e.g. 0.7.0 or 0.7.0-rc.1 or 0.7.0-nightly+abc1234)'
+        required: true
+        type: string
+      channel:
+        description: 'Release channel: stable | rc | nightly'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as prerelease on GitHub'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      GPG_PRIVATE_KEY:
+        required: true
+      GPG_PASSPHRASE:
+        required: true
+
+env:
+  FEATURES: "sqlite,postgres,mysql,mssql,mongodb,redis,dynamodb,cloudwatch,influxdb,clickhouse,aws"
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    name: Build Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs_on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - arch: arm64
+            runs_on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+            rpm_arch: aarch64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Resolve channel identity
+        run: |
+          if [ "${{ inputs.channel }}" = "nightly" ]; then
+            echo "APP_ID=dory-nightly"            >> "$GITHUB_ENV"
+            echo "APP_NAME=Dory Nightly"          >> "$GITHUB_ENV"
+            echo "PKG_NAME=dory-nightly"          >> "$GITHUB_ENV"
+            echo "BUNDLE_ID=dev.dory.app.nightly" >> "$GITHUB_ENV"
+          else
+            echo "APP_ID=dory"            >> "$GITHUB_ENV"
+            echo "APP_NAME=Dory"          >> "$GITHUB_ENV"
+            echo "PKG_NAME=dory"          >> "$GITHUB_ENV"
+            echo "BUNDLE_ID=dev.dory.app" >> "$GITHUB_ENV"
+          fi
+          BRAND_DIR="resources/branding/${{ inputs.channel }}"
+          [ -d "$BRAND_DIR" ] || BRAND_DIR="resources/branding/stable"
+          echo "BRAND_DIR=$BRAND_DIR" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rust-src
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mold \
+            pkg-config \
+            libssl-dev \
+            libdbus-1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+          if apt-cache show libfuse2 >/dev/null 2>&1; then
+            sudo apt-get install -y libfuse2
+          else
+            sudo apt-get install -y libfuse2t64
+          fi
+
+          sudo apt-get install -y gettext imagemagick
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          prefix-key: "v0-rust"
+          shared-key: linux-${{ matrix.arch }}
+          cache-targets: true
+          cache-on-failure: true
+
+      - name: Stamp workspace version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # The workspace version is a single line in the root Cargo.toml. Bail if
+          # zero or several lines match, so a structural change to Cargo.toml can
+          # never silently rewrite the wrong line(s). VERSION is read from env, not
+          # interpolated into the script, so a crafted tag cannot inject shell.
+          MATCHES=$(grep -c '^version = "' Cargo.toml)
+          if [ "$MATCHES" -ne 1 ]; then
+            echo "::error::Expected exactly 1 workspace version line in Cargo.toml, found $MATCHES."
+            exit 1
+          fi
+          sed -i "s|^version = \".*\"|version = \"${VERSION}\"|" Cargo.toml
+          grep -qF "version = \"${VERSION}\"" Cargo.toml \
+            || { echo "::error::Version stamp did not apply."; exit 1; }
+
+      - name: Build Dory
+        # No --locked here: the version stamp above mutates Cargo.toml, so cargo must
+        # refresh the workspace entries in Cargo.lock. Dependency-lock integrity is
+        # already enforced by the deterministic-tests and clippy gates (--locked) on
+        # this same commit; here only the local workspace version changes.
+        run: cargo build --release --features "$FEATURES" --target ${{ matrix.target }}
+
+      - name: Create package
+        run: |
+          BRAND_DIR="resources/branding/${{ inputs.channel }}"
+          [ -d "$BRAND_DIR" ] || BRAND_DIR="resources/branding/stable"
+
+          mkdir -p pkg/resources/branding/stable
+          mkdir -p pkg/resources/desktop
+          mkdir -p pkg/resources/mime
+          mkdir -p pkg/scripts
+
+          cp target/${{ matrix.target }}/release/dory pkg/dory
+          chmod +x pkg/dory
+
+          cp "$BRAND_DIR/mark.svg" pkg/resources/branding/stable/mark.svg
+          cp resources/desktop/dory.desktop pkg/resources/desktop/
+          cp resources/mime/dory-sql.xml pkg/resources/mime/
+
+          cp LICENSE-MIT pkg/
+          cp LICENSE-APACHE pkg/
+
+          cp scripts/install.sh pkg/scripts/
+          cp scripts/uninstall.sh pkg/scripts/
+          chmod +x pkg/scripts/*.sh
+
+      - name: Create tar archive
+        run: |
+          cd pkg
+          tar -czf ../dory-linux-${{ matrix.arch }}.tar.gz .
+
+      - name: Download appimagetool
+        # Pinned to a tagged release (not the rolling `continuous`) and verified
+        # by sha256 before exec. appimagetool runs right before the AppImage is
+        # GPG-signed, so a compromised binary would be signed as ours.
+        env:
+          APPIMAGETOOL_VERSION: "1.9.1"
+          SHA256_X86_64: "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+          SHA256_AARCH64: "f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158"
+        run: |
+          case "${{ matrix.arch }}" in
+            amd64) ARCH=x86_64;  EXPECTED="$SHA256_X86_64"  ;;
+            arm64) ARCH=aarch64; EXPECTED="$SHA256_AARCH64" ;;
+            *) echo "::error::Unsupported arch '${{ matrix.arch }}'"; exit 1 ;;
+          esac
+
+          curl -fsSL -o "appimagetool-${ARCH}.AppImage" \
+            "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${ARCH}.AppImage"
+
+          echo "${EXPECTED}  appimagetool-${ARCH}.AppImage" | sha256sum -c -
+
+          chmod +x "appimagetool-${ARCH}.AppImage"
+          echo "APPIMAGE_ARCH=$ARCH" >> "$GITHUB_ENV"
+
+      - name: Create AppImage
+        run: |
+          VERSION="${{ inputs.version }}"
+          BRAND_DIR="resources/branding/${{ inputs.channel }}"
+          [ -d "$BRAND_DIR" ] || BRAND_DIR="resources/branding/stable"
+
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
+          mkdir -p AppDir/usr/share/mime/packages
+          mkdir -p AppDir/usr/share/licenses/dory
+
+          cp target/${{ matrix.target }}/release/dory AppDir/usr/bin/
+          chmod +x AppDir/usr/bin/dory
+
+          cp resources/desktop/dory.desktop "AppDir/usr/share/applications/$APP_ID.desktop"
+          sed -i -e "s|@EXEC_PATH@|dory|g" -e "s|@APP_NAME@|$APP_NAME|g" -e "s|@APP_ID@|$APP_ID|g" "AppDir/usr/share/applications/$APP_ID.desktop"
+
+          cp "$BRAND_DIR/mark.svg" "AppDir/usr/share/icons/hicolor/scalable/apps/$APP_ID.svg"
+
+          cp resources/mime/dory-sql.xml AppDir/usr/share/mime/packages/
+          sed -i "s|@APP_ID@|$APP_ID|g" AppDir/usr/share/mime/packages/dory-sql.xml
+
+          cp LICENSE-MIT AppDir/usr/share/licenses/dory/
+          cp LICENSE-APACHE AppDir/usr/share/licenses/dory/
+
+          ln -sf usr/bin/dory AppDir/AppRun
+          ln -sf "usr/share/applications/$APP_ID.desktop" "AppDir/$APP_ID.desktop"
+          ln -sf "usr/share/icons/hicolor/scalable/apps/$APP_ID.svg" "AppDir/$APP_ID.svg"
+
+          APPIMAGE_EXTRACT_AND_RUN=1 VERSION="$VERSION" ./appimagetool-${{ env.APPIMAGE_ARCH }}.AppImage AppDir
+
+          APPIMAGE_FILE=$(find . -maxdepth 1 -name "*.AppImage" ! -name "appimagetool-*.AppImage" | head -n 1)
+          if [ -z "$APPIMAGE_FILE" ]; then
+            echo "AppImage output not found"
+            exit 1
+          fi
+
+          mv "$APPIMAGE_FILE" dory-linux-${{ matrix.arch }}.AppImage
+
+      - name: Generate PNG icons
+        run: |
+          BRAND_DIR="resources/branding/${{ inputs.channel }}"
+          [ -d "$BRAND_DIR" ] || BRAND_DIR="resources/branding/stable"
+
+          mkdir -p packaging/icons/256x256/apps
+          mkdir -p packaging/icons/128x128/apps
+          mkdir -p packaging/icons/64x64/apps
+          mkdir -p packaging/icons/48x48/apps
+          mkdir -p packaging/icons/32x32/apps
+          mkdir -p packaging/icons/16x16/apps
+
+          convert "$BRAND_DIR/mark.svg" -resize 256x256 packaging/icons/256x256/apps/dory.png
+          convert "$BRAND_DIR/mark.svg" -resize 128x128 packaging/icons/128x128/apps/dory.png
+          convert "$BRAND_DIR/mark.svg" -resize 64x64 packaging/icons/64x64/apps/dory.png
+          convert "$BRAND_DIR/mark-small.svg" -resize 48x48 packaging/icons/48x48/apps/dory.png
+          convert "$BRAND_DIR/mark-small.svg" -resize 32x32 packaging/icons/32x32/apps/dory.png
+          convert "$BRAND_DIR/mark-small.svg" -resize 16x16 packaging/icons/16x16/apps/dory.png
+
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+        with:
+          go-version: stable
+
+      - name: Install nfpm
+        # Pinned: @latest would silently pull a new nfpm into the signing job.
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+
+      - name: Generate packages
+        run: |
+          VERSION="${{ inputs.version }}"
+
+          export VERSION
+          export ARCH=${{ matrix.deb_arch }}
+          export TARGET=${{ matrix.target }}
+          export APP_ID APP_NAME PKG_NAME BUNDLE_ID BRAND_DIR
+
+          sed -i -e "s|@APP_NAME@|$APP_NAME|g" -e "s|@APP_ID@|$APP_ID|g" packaging/dory.desktop
+
+          envsubst < packaging/nfpm.deb.yaml > nfpm.deb.yaml
+          ~/go/bin/nfpm package --packager deb --config nfpm.deb.yaml --target ${PKG_NAME}_${VERSION}_linux_${{ matrix.deb_arch }}.deb
+          export ARCH=${{ matrix.rpm_arch }}
+          envsubst < packaging/nfpm.rpm.yaml > nfpm.rpm.yaml
+          ~/go/bin/nfpm package --packager rpm --config nfpm.rpm.yaml --target ${PKG_NAME}-${VERSION}-1.${{ matrix.rpm_arch }}.rpm
+
+      - name: Install signing tools
+        run: sudo apt-get install -y rpm debsigs
+
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd  # v7.0.0
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Sign .deb packages
+        run: |
+          GPG_KEY_ID=$(gpg --list-keys --keyid-format long | grep -A1 'pub' | tail -1 | awk '{print $1}')
+          for deb in *.deb; do
+            debsigs --sign=origin -k "$GPG_KEY_ID" "$deb"
+          done
+
+      - name: Configure RPM signing
+        run: |
+          GPG_KEY_ID=$(gpg --list-keys --keyid-format long | grep -A1 'pub' | tail -1 | awk '{print $1}')
+          {
+            echo "%_gpg_name $GPG_KEY_ID"
+            echo "%__gpg /usr/bin/gpg"
+            echo "%__gpg_sign_cmd %{__gpg} gpg --batch --no-armor --passphrase-fd 3 --no-secmem-warning -u '%{_gpg_name}' -sbo %{__signature_filename} %{__plaintext_filename}"
+          } > ~/.rpmmacros
+
+      - name: Sign .rpm packages
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          for rpm in *.rpm; do
+            rpm --addsign "$rpm" 3< <(printf '%s' "$GPG_PASSPHRASE")
+          done
+
+      - name: Sign artifacts
+        run: |
+          gpg --armor --detach-sign dory-linux-${{ matrix.arch }}.tar.gz
+          gpg --armor --detach-sign dory-linux-${{ matrix.arch }}.AppImage
+          gpg --armor --detach-sign *.deb
+          gpg --armor --detach-sign *.rpm
+
+      - name: Generate checksums
+        run: |
+          sha256sum dory-linux-${{ matrix.arch }}.tar.gz > dory-linux-${{ matrix.arch }}.tar.gz.sha256
+          sha256sum dory-linux-${{ matrix.arch }}.AppImage > dory-linux-${{ matrix.arch }}.AppImage.sha256
+          sha256sum *.deb > dory_${{ matrix.arch }}.deb.sha256
+          sha256sum *.rpm > dory_${{ matrix.arch }}.rpm.sha256
+
+      - name: Upload artifacts
+        if: env.ACT != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dory-linux-${{ matrix.arch }}.tar.gz
+            dory-linux-${{ matrix.arch }}.tar.gz.sha256
+            dory-linux-${{ matrix.arch }}.tar.gz.asc
+            dory-linux-${{ matrix.arch }}.AppImage
+            dory-linux-${{ matrix.arch }}.AppImage.sha256
+            dory-linux-${{ matrix.arch }}.AppImage.asc
+            *.deb
+            *.deb.asc
+            dory_${{ matrix.arch }}.deb.sha256
+            *.rpm
+            *.rpm.asc
+            dory_${{ matrix.arch }}.rpm.sha256
+          retention-days: 90
+
+      - name: (act) Store artifacts locally
+        if: env.ACT == 'true'
+        run: |
+          mkdir -p /tmp/artifacts/linux-${{ matrix.arch }}
+          cp dory-linux-${{ matrix.arch }}.tar.gz /tmp/artifacts/linux-${{ matrix.arch }}/
+          cp dory-linux-${{ matrix.arch }}.tar.gz.sha256 /tmp/artifacts/linux-${{ matrix.arch }}/
+          cp dory-linux-${{ matrix.arch }}.tar.gz.asc /tmp/artifacts/linux-${{ matrix.arch }}/
+          cp dory-linux-${{ matrix.arch }}.AppImage /tmp/artifacts/linux-${{ matrix.arch }}/
+          cp dory-linux-${{ matrix.arch }}.AppImage.sha256 /tmp/artifacts/linux-${{ matrix.arch }}/
+          cp dory-linux-${{ matrix.arch }}.AppImage.asc /tmp/artifacts/linux-${{ matrix.arch }}/
+          cp *.deb /tmp/artifacts/linux-${{ matrix.arch }}/
+          cp *.deb.asc /tmp/artifacts/linux-${{ matrix.arch }}/
+          cp dory_${{ matrix.arch }}.deb.sha256 /tmp/artifacts/linux-${{ matrix.arch }}/
+          cp *.rpm /tmp/artifacts/linux-${{ matrix.arch }}/
+          cp *.rpm.asc /tmp/artifacts/linux-${{ matrix.arch }}/
+          cp dory_${{ matrix.arch }}.rpm.sha256 /tmp/artifacts/linux-${{ matrix.arch }}/
+
+  build-macos:
+    name: Build macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Build the x86_64 target on the Apple Silicon runner via cross
+          # compilation. GitHub's Intel macOS runner is ~5x slower; arm64 ->
+          # x86_64 is a trivial same-OS cross (universal SDK, shared linker),
+          # so this cuts the Intel build from ~1h to the arm64 build's time.
+          - arch: amd64
+            runs_on: macos-14
+            target: x86_64-apple-darwin
+          - arch: arm64
+            runs_on: macos-14
+            target: aarch64-apple-darwin
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Resolve channel identity
+        run: |
+          if [ "${{ inputs.channel }}" = "nightly" ]; then
+            echo "APP_ID=dory-nightly"            >> "$GITHUB_ENV"
+            echo "APP_NAME=Dory Nightly"          >> "$GITHUB_ENV"
+            echo "PKG_NAME=dory-nightly"          >> "$GITHUB_ENV"
+            echo "BUNDLE_ID=dev.dory.app.nightly" >> "$GITHUB_ENV"
+          else
+            echo "APP_ID=dory"            >> "$GITHUB_ENV"
+            echo "APP_NAME=Dory"          >> "$GITHUB_ENV"
+            echo "PKG_NAME=dory"          >> "$GITHUB_ENV"
+            echo "BUNDLE_ID=dev.dory.app" >> "$GITHUB_ENV"
+          fi
+          BRAND_DIR="resources/branding/${{ inputs.channel }}"
+          [ -d "$BRAND_DIR" ] || BRAND_DIR="resources/branding/stable"
+          echo "BRAND_DIR=$BRAND_DIR" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rust-src
+
+      - name: Add cross target to the pinned toolchain
+        # rust-toolchain.toml pins the toolchain cargo actually uses; the step
+        # above adds the target to `stable` instead, so the x86_64-apple-darwin
+        # std is missing on the pinned toolchain when cross-compiling amd64 on the
+        # Apple Silicon runner. Add it to the pinned toolchain. No-op for the
+        # native arm64 target.
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          prefix-key: "v0-rust"
+          shared-key: macos-${{ matrix.arch }}
+          cache-targets: true
+          cache-on-failure: true
+
+      - name: Stamp workspace version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # See the Linux build job for the rationale (single-line guard + env-routed
+          # version). BSD sed needs the -i.bak form.
+          MATCHES=$(grep -c '^version = "' Cargo.toml)
+          if [ "$MATCHES" -ne 1 ]; then
+            echo "::error::Expected exactly 1 workspace version line in Cargo.toml, found $MATCHES."
+            exit 1
+          fi
+          sed -i.bak "s|^version = \".*\"|version = \"${VERSION}\"|" Cargo.toml
+          grep -qF "version = \"${VERSION}\"" Cargo.toml \
+            || { echo "::error::Version stamp did not apply."; exit 1; }
+
+      - name: Build Dory
+        # vendored-openssl makes ssh2/libssh2 compile OpenSSL from source for the
+        # target instead of linking the runner's system OpenSSL. Required to
+        # cross-compile x86_64 on the Apple Silicon runner (no x86_64 OpenSSL is
+        # present), and keeps both macOS binaries self-contained at runtime.
+        # No --locked: the version stamp above mutates Cargo.toml; see the Linux build
+        # step for the full rationale.
+        run: cargo build --release --features "$FEATURES,vendored-openssl" --target ${{ matrix.target }}
+
+      - name: Create app bundle
+        run: |
+          VERSION="${{ inputs.version }}"
+          BRAND_DIR="resources/branding/${{ inputs.channel }}"
+          [ -d "$BRAND_DIR" ] || BRAND_DIR="resources/branding/stable"
+          APP_BUNDLE="$APP_NAME.app"
+
+          mkdir -p "$APP_BUNDLE/Contents/MacOS"
+          mkdir -p "$APP_BUNDLE/Contents/Resources"
+
+          cp target/${{ matrix.target }}/release/dory "$APP_BUNDLE/Contents/MacOS/"
+          chmod +x "$APP_BUNDLE/Contents/MacOS/dory"
+
+          cp "$BRAND_DIR/mark.svg" "$APP_BUNDLE/Contents/Resources/dory.svg"
+
+          # Generate AppIcon.icns from the channel's brand mark. The mark PNGs
+          # are 256px (the max macOS .icns goes to 1024px), so the icon is
+          # upscaled; a dedicated 1024px per-channel PNG in resources/branding
+          # would let the retina sizes render natively. Fall back to the stable
+          # mark when the channel has no mark of its own (rc/preview).
+          if [ -f "$BRAND_DIR/mark-256.png" ]; then
+            ICON_SRC="$BRAND_DIR/mark-256.png"
+          else
+            ICON_SRC="resources/branding/stable/mark-256.png"
+          fi
+          ICONSET="$APP_BUNDLE/Contents/Resources/AppIcon.iconset"
+          mkdir -p "$ICONSET"
+          for SIZE in 16 32 128 256 512; do
+            sips -z "$SIZE" "$SIZE" "$ICON_SRC" --out "$ICONSET/icon_${SIZE}x${SIZE}.png" >/dev/null
+            DPR=$((SIZE * 2))
+            sips -z "$DPR" "$DPR" "$ICON_SRC" --out "$ICONSET/icon_${SIZE}x${SIZE}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$ICONSET" -o "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+          rm -rf "$ICONSET"
+
+          sed -e "s/\${VERSION}/$VERSION/g" -e "s/\${APP_NAME}/$APP_NAME/g" -e "s/\${BUNDLE_ID}/$BUNDLE_ID/g" resources/macos/Info.plist > "$APP_BUNDLE/Contents/Info.plist"
+
+          chmod +x "$APP_BUNDLE/Contents/MacOS/dory"
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Create DMG
+        run: |
+          VERSION="${{ inputs.version }}"
+          APP_BUNDLE="$APP_NAME.app"
+
+          create-dmg \
+            --volname "$APP_NAME" \
+            --window-pos 200 120 \
+            --window-size 800 450 \
+            --icon-size 100 \
+            --icon "$APP_BUNDLE" 200 190 \
+            --hide-extension "$APP_BUNDLE" \
+            --app-drop-link 600 185 \
+            --no-internet-enable \
+            --skip-jenkins \
+            dory-macos-${{ matrix.arch }}.dmg \
+            "$APP_BUNDLE"
+
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd  # v7.0.0
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Sign artifacts
+        run: |
+          gpg --armor --detach-sign dory-macos-${{ matrix.arch }}.dmg
+
+      - name: Generate checksum
+        run: shasum -a 256 dory-macos-${{ matrix.arch }}.dmg > dory-macos-${{ matrix.arch }}.dmg.sha256
+
+      - name: Upload artifacts
+        if: env.ACT != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            dory-macos-${{ matrix.arch }}.dmg
+            dory-macos-${{ matrix.arch }}.dmg.sha256
+            dory-macos-${{ matrix.arch }}.dmg.asc
+          retention-days: 90
+
+      - name: (act) Store artifacts locally
+        if: env.ACT == 'true'
+        run: |
+          mkdir -p /tmp/artifacts/macos-${{ matrix.arch }}
+          cp dory-macos-${{ matrix.arch }}.dmg /tmp/artifacts/macos-${{ matrix.arch }}/
+          cp dory-macos-${{ matrix.arch }}.dmg.sha256 /tmp/artifacts/macos-${{ matrix.arch }}/
+          cp dory-macos-${{ matrix.arch }}.dmg.asc /tmp/artifacts/macos-${{ matrix.arch }}/
+
+  build-windows:
+    name: Build Windows amd64
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Resolve channel identity
+        shell: pwsh
+        run: |
+          if ("${{ inputs.channel }}" -eq "nightly") {
+            "APP_NAME=Dory Nightly"   | Out-File -FilePath $env:GITHUB_ENV -Append
+            "MY_APP_ID={{7F1C2A3B-4D5E-6F70-8192-A3B4C5D6E7F8}" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            "APP_NAME=Dory"   | Out-File -FilePath $env:GITHUB_ENV -Append
+            "MY_APP_ID={{D8A3E981-6A8D-4B8F-9E09-86D8DEB7A6F1}" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rust-src
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          prefix-key: "v0-rust"
+          shared-key: windows-amd64
+          cache-targets: true
+          cache-on-failure: true
+
+      - name: Stamp workspace version
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # See the Linux build job for the rationale (single-line guard + env-routed
+          # version).
+          $content = Get-Content Cargo.toml
+          $versionLines = @($content | Select-String -Pattern '^version = "').Count
+          if ($versionLines -ne 1) {
+            Write-Output "::error::Expected exactly 1 workspace version line in Cargo.toml, found $versionLines."
+            exit 1
+          }
+          $stamped = $content -replace '^version = ".*"', "version = `"$env:VERSION`""
+          $stamped | Set-Content Cargo.toml
+          if (-not (Select-String -Path Cargo.toml -Pattern ([regex]::Escape("version = `"$env:VERSION`"")))) {
+            Write-Output "::error::Version stamp did not apply."
+            exit 1
+          }
+
+      - name: Build Dory
+        # No --locked: the version stamp above mutates Cargo.toml; see the Linux build
+        # step for the full rationale.
+        run: cargo build --release --features "$env:FEATURES" --target x86_64-pc-windows-msvc
+
+      - name: Install ImageMagick
+        # Pinned: an unversioned choco install pulls whatever the feed serves into
+        # the icon-generation step.
+        run: choco install imagemagick --version=7.1.2.2500 -y
+
+      - name: Create ICO from SVG
+        run: |
+          $BrandDir = "resources/branding/${{ inputs.channel }}"
+          if (-Not (Test-Path $BrandDir)) { $BrandDir = "resources/branding/stable" }
+
+          magick convert -background none -resize 256x256 "$BrandDir/mark.svg" dory-256.png
+          magick convert -background none -resize 128x128 "$BrandDir/mark.svg" dory-128.png
+          magick convert -background none -resize 64x64 "$BrandDir/mark.svg" dory-64.png
+          magick convert -background none -resize 48x48 "$BrandDir/mark-small.svg" dory-48.png
+          magick convert -background none -resize 32x32 "$BrandDir/mark-small.svg" dory-32.png
+          magick convert -background none -resize 16x16 "$BrandDir/mark-small.svg" dory-16.png
+          magick convert dory-16.png dory-32.png dory-48.png dory-64.png dory-128.png dory-256.png dory.ico
+
+      - name: Create portable package
+        run: |
+          New-Item -Path pkg -ItemType Directory -Force | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/dory.exe pkg/dory.exe
+          Copy-Item dory.ico pkg/dory.ico
+          Compress-Archive -Path pkg/* -DestinationPath dory-windows-amd64.zip -Force
+
+      - name: Prepare installer files
+        run: |
+          New-Item -Path installer -ItemType Directory -Force | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/dory.exe installer/dory.exe
+          Copy-Item dory.ico installer/dory.ico
+          Copy-Item resources/windows/installer.iss installer/installer.iss
+          Copy-Item LICENSE-MIT installer/LICENSE-MIT
+          Copy-Item LICENSE-APACHE installer/LICENSE-APACHE
+
+      - name: Build installer
+        uses: Minionguyjpro/Inno-Setup-Action@ec985ef724d1fb4a05bfbc1a8e49930dc76d2b0c  # v1.2.9
+        env:
+          DORY_APP_NAME: ${{ env.APP_NAME }}
+          DORY_APP_ID: ${{ env.MY_APP_ID }}
+          DORY_APP_VERSION: ${{ inputs.version }}
+        with:
+          path: installer/installer.iss
+
+      - name: Move installer
+        run: Move-Item installer/output/dory-windows-amd64-setup.exe dory-windows-amd64-setup.exe -Force
+
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd  # v7.0.0
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Sign artifacts
+        run: |
+          gpg --armor --detach-sign dory-windows-amd64.zip
+          gpg --armor --detach-sign dory-windows-amd64-setup.exe
+
+      - name: Generate checksums
+        run: |
+          $hashZip = (Get-FileHash -Algorithm SHA256 dory-windows-amd64.zip).Hash.ToLower()
+          "$hashZip  dory-windows-amd64.zip" | Out-File -FilePath dory-windows-amd64.zip.sha256 -Encoding ascii
+
+          $hashExe = (Get-FileHash -Algorithm SHA256 dory-windows-amd64-setup.exe).Hash.ToLower()
+          "$hashExe  dory-windows-amd64-setup.exe" | Out-File -FilePath dory-windows-amd64-setup.exe.sha256 -Encoding ascii
+
+      - name: Upload artifacts
+        if: env.ACT != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: windows-amd64
+          path: |
+            dory-windows-amd64.zip
+            dory-windows-amd64.zip.sha256
+            dory-windows-amd64.zip.asc
+            dory-windows-amd64-setup.exe
+            dory-windows-amd64-setup.exe.sha256
+            dory-windows-amd64-setup.exe.asc
+          retention-days: 90
+
+      - name: (act) Store artifacts locally
+        if: env.ACT == 'true'
+        shell: pwsh
+        run: |
+          New-Item -Path C:\tmp\artifacts\windows-amd64 -ItemType Directory -Force | Out-Null
+          Copy-Item dory-windows-amd64.zip C:\tmp\artifacts\windows-amd64\
+          Copy-Item dory-windows-amd64.zip.sha256 C:\tmp\artifacts\windows-amd64\
+          Copy-Item dory-windows-amd64.zip.asc C:\tmp\artifacts\windows-amd64\
+          Copy-Item dory-windows-amd64-setup.exe C:\tmp\artifacts\windows-amd64\
+          Copy-Item dory-windows-amd64-setup.exe.sha256 C:\tmp\artifacts\windows-amd64\
+          Copy-Item dory-windows-amd64-setup.exe.asc C:\tmp\artifacts\windows-amd64\

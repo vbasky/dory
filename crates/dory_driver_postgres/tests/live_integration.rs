@@ -1,0 +1,962 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::result_large_err
+)]
+
+use dory_core::{
+    CollectionRef, ColumnAssignment, ConnectionProfile, DbConfig, DbDriver, DbError,
+    DescribeRequest, ExplainRequest, MutationRequest, OrderByColumn, Pagination, QueryRequest,
+    RecordIdentity, RowDelete, RowInsert, RowPatch, SchemaLoadingStrategy, SemanticFilter,
+    SemanticRequest, SqlUpdateRequest, SqlUpsertRequest, TableBrowseRequest, TableCountRequest,
+    TableRef, Value, WhereOperator,
+};
+use dory_driver_postgres::PostgresDriver;
+use dory_test_support::containers;
+use std::time::Duration;
+
+fn connect_postgres(
+    uri: String,
+) -> Result<(Box<dyn dory_core::Connection>, PostgresDriver), dory_core::DbError> {
+    let driver = PostgresDriver::new();
+    let profile = ConnectionProfile::new(
+        "live-postgres",
+        DbConfig::Postgres {
+            use_uri: true,
+            uri: Some(uri),
+            host: String::new(),
+            port: 5432,
+            user: String::new(),
+            database: "postgres".to_string(),
+            ssl_mode: Some("prefer".to_string()),
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+        },
+    );
+
+    let connection =
+        containers::retry_db_operation(Duration::from_secs(30), || -> Result<_, DbError> {
+            let connection = driver.connect(&profile)?;
+            connection.ping()?;
+            Ok(connection)
+        })?;
+
+    Ok((connection, driver))
+}
+
+fn assert_text_array_matches_server_text(decoded: &Value, server_text: &Value) {
+    let Value::Array(values) = decoded else {
+        panic!("expected decoded text array, got {decoded:?}");
+    };
+    let Value::Text(server_text) = server_text else {
+        panic!("expected server canonical array text, got {server_text:?}");
+    };
+
+    let decoded_text: Vec<Option<String>> = values
+        .iter()
+        .map(|value| match value {
+            Value::Text(text) => Some(text.clone()),
+            Value::Null => None,
+            other => panic!("expected array text or NULL, got {other:?}"),
+        })
+        .collect();
+    let canonical_text: Vec<Option<String>> =
+        serde_json::from_str(server_text).expect("server array text must be JSON");
+
+    assert_eq!(decoded_text, canonical_text);
+}
+
+// ---------------------------------------------------------------------------
+// Basic connectivity
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_live_connect_ping_query_and_schema() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        let result = connection.execute(&QueryRequest::new("SELECT 1 AS one"))?;
+        assert_eq!(result.rows.len(), 1);
+
+        assert_eq!(
+            connection.schema_loading_strategy(),
+            SchemaLoadingStrategy::ConnectionPerDatabase
+        );
+
+        let databases = connection.list_databases()?;
+        assert!(!databases.is_empty());
+
+        let schema = connection.schema()?;
+        assert!(schema.is_relational());
+        let _ = schema.databases();
+
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Schema introspection
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_schema_introspection() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE test_users (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                email VARCHAR(255) UNIQUE,
+                age INTEGER DEFAULT 0
+            )",
+        ))?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE test_orders (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES test_users(id) ON DELETE CASCADE,
+                amount NUMERIC(10, 2) NOT NULL
+            )",
+        ))?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE INDEX idx_orders_user_id ON test_orders(user_id)",
+        ))?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE VIEW test_user_view AS SELECT id, name FROM test_users",
+        ))?;
+
+        let schema = connection.schema()?;
+        assert!(schema.is_relational());
+
+        let databases = schema.databases();
+        assert!(!databases.is_empty());
+
+        let table = connection.table_details("postgres", Some("public"), "test_users")?;
+        assert_eq!(table.name, "test_users");
+
+        let columns = table.columns.as_ref().expect("columns should be loaded");
+        assert!(columns.len() >= 4);
+
+        let id_col = columns.iter().find(|c| c.name == "id").expect("id column");
+        assert!(id_col.is_primary_key);
+        assert!(!id_col.nullable);
+
+        let name_col = columns
+            .iter()
+            .find(|c| c.name == "name")
+            .expect("name column");
+        assert!(!name_col.nullable);
+
+        let email_col = columns
+            .iter()
+            .find(|c| c.name == "email")
+            .expect("email column");
+        assert!(email_col.nullable);
+
+        let age_col = columns
+            .iter()
+            .find(|c| c.name == "age")
+            .expect("age column");
+        assert!(age_col.nullable);
+
+        let indexes = table.indexes.as_ref().expect("indexes should be loaded");
+        let idx_data = match indexes {
+            dory_core::IndexData::Relational(v) => v,
+            _ => panic!("expected relational index data"),
+        };
+        assert!(idx_data.iter().any(|i| i.is_primary));
+
+        let relational = schema.as_relational().expect("should be relational schema");
+        let has_view = relational
+            .schemas
+            .iter()
+            .flat_map(|s| s.views.iter())
+            .any(|v| v.name == "test_user_view");
+        assert!(has_view, "view should appear in schema");
+
+        let orders_table = connection.table_details("postgres", Some("public"), "test_orders")?;
+        let fks = orders_table
+            .foreign_keys
+            .as_ref()
+            .expect("foreign keys should be loaded");
+        assert!(!fks.is_empty());
+        let fk = &fks[0];
+        assert_eq!(fk.referenced_table, "test_users");
+        assert_eq!(fk.columns, vec!["user_id"]);
+        assert_eq!(fk.referenced_columns, vec!["id"]);
+
+        let schema_features = connection.schema_features();
+        assert!(!schema_features.is_empty());
+
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// CRUD operations
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_crud_operations() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE crud_test (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                value INTEGER DEFAULT 0
+            )",
+        ))?;
+
+        let insert_result = connection.insert_row(&RowInsert::new(
+            "crud_test".to_string(),
+            Some("public".to_string()),
+            vec!["name".to_string(), "value".to_string()],
+            vec![Value::Text("alice".to_string()), Value::Int(42)],
+        ))?;
+        assert_eq!(insert_result.affected_rows, 1);
+        assert!(insert_result.returning_row.is_some());
+
+        let rows = connection
+            .execute(&QueryRequest::new(
+                "SELECT * FROM crud_test WHERE name = 'alice'",
+            ))?
+            .rows;
+        assert_eq!(rows.len(), 1);
+
+        let update_result = connection.update_row(&RowPatch::new(
+            RecordIdentity::composite(
+                vec!["name".to_string()],
+                vec![Value::Text("alice".to_string())],
+            ),
+            "crud_test".to_string(),
+            Some("public".to_string()),
+            vec![("value".to_string(), Value::Int(99))],
+        ))?;
+        assert_eq!(update_result.affected_rows, 1);
+        assert!(update_result.returning_row.is_some());
+
+        let rows = connection
+            .execute(&QueryRequest::new(
+                "SELECT value FROM crud_test WHERE name = 'alice'",
+            ))?
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int(99));
+
+        let delete_result = connection.delete_row(&RowDelete::new(
+            RecordIdentity::composite(
+                vec!["name".to_string()],
+                vec![Value::Text("alice".to_string())],
+            ),
+            "crud_test".to_string(),
+            Some("public".to_string()),
+        ))?;
+        assert_eq!(delete_result.affected_rows, 1);
+
+        let rows = connection
+            .execute(&QueryRequest::new("SELECT * FROM crud_test"))?
+            .rows;
+        assert!(rows.is_empty());
+
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires Docker daemon and the pinned pgvector PostgreSQL 16 image"]
+fn postgres_pgvector_text_matches_server_output_and_crud_returning() -> Result<(), DbError> {
+    containers::with_pgvector_postgres_16_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new("CREATE EXTENSION vector"))?;
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE pgvector_display (
+                id INTEGER PRIMARY KEY,
+                vector_value vector,
+                halfvec_value halfvec,
+                sparsevec_value sparsevec,
+                vector_values vector[],
+                halfvec_values halfvec[],
+                sparsevec_values sparsevec[]
+            )",
+        ))?;
+        connection.execute(&QueryRequest::new(
+            "INSERT INTO pgvector_display VALUES (
+                1,
+                '[1e-6,1e20,-1e-6,-1e20]',
+                '[1.5,-2.25]',
+                '{1:1e-6,4:-1e20}/4',
+                ARRAY['[1e-6,1e20,-1e-6,-1e20]'::vector, NULL, '[2,3]'::vector],
+                ARRAY['[1.5,-2.25]'::halfvec, NULL, '[3,4]'::halfvec],
+                ARRAY['{1:1e-6,4:-1e20}/4'::sparsevec, NULL, '{2:3}/4'::sparsevec]
+            )",
+        ))?;
+
+        let result = connection.execute(&QueryRequest::new(
+            "SELECT
+                vector_value, vector_value::text,
+                halfvec_value, halfvec_value::text,
+                sparsevec_value, sparsevec_value::text,
+                vector_values, array_to_json(vector_values)::text,
+                halfvec_values, array_to_json(halfvec_values)::text,
+                sparsevec_values, array_to_json(sparsevec_values)::text,
+                NULL::vector, NULL::vector[]
+             FROM pgvector_display",
+        ))?;
+        let row = &result.rows[0];
+
+        for (value_index, text_index) in [(0, 1), (2, 3), (4, 5)] {
+            assert_eq!(row[value_index], row[text_index]);
+        }
+        assert_text_array_matches_server_text(&row[6], &row[7]);
+        assert_text_array_matches_server_text(&row[8], &row[9]);
+        assert_text_array_matches_server_text(&row[10], &row[11]);
+        assert_eq!(row[12], Value::Null);
+        assert_eq!(row[13], Value::Null);
+
+        let inserted = connection.insert_row(&RowInsert::with_typed_assignments(
+            "pgvector_display".to_string(),
+            Some("public".to_string()),
+            vec![
+                ColumnAssignment::new("id", Value::Int(2)),
+                ColumnAssignment::typed(
+                    "vector_value",
+                    Value::Text("[1e-6,1e20,-1e-6,-1e20]".to_string()),
+                    "vector",
+                ),
+            ],
+        ))?;
+        let inserted_value = inserted.returning_row.as_ref().and_then(|row| row.get(1));
+        let server_value = connection
+            .execute(&QueryRequest::new(
+                "SELECT vector_value::text FROM pgvector_display WHERE id = 2",
+            ))?
+            .rows[0][0]
+            .clone();
+        assert_eq!(inserted_value, Some(&server_value));
+
+        let updated = connection.update_row(&RowPatch::with_typed_changes(
+            RecordIdentity::composite(vec!["id".to_string()], vec![Value::Int(2)]),
+            "pgvector_display".to_string(),
+            Some("public".to_string()),
+            vec![ColumnAssignment::typed(
+                "vector_value",
+                Value::Text("[2,3]".to_string()),
+                "vector",
+            )],
+        ))?;
+        let updated_value = updated.returning_row.as_ref().and_then(|row| row.get(1));
+        let server_value = connection
+            .execute(&QueryRequest::new(
+                "SELECT vector_value::text FROM pgvector_display WHERE id = 2",
+            ))?
+            .rows[0][0]
+            .clone();
+        assert_eq!(updated_value, Some(&server_value));
+
+        let deleted = connection.delete_row(&RowDelete::new(
+            RecordIdentity::composite(vec!["id".to_string()], vec![Value::Int(2)]),
+            "pgvector_display".to_string(),
+            Some("public".to_string()),
+        ))?;
+        assert_eq!(
+            deleted.returning_row.as_ref().and_then(|row| row.get(1)),
+            Some(&server_value)
+        );
+
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_text_search_text_matches_server_output() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE text_search_display (
+                id INTEGER PRIMARY KEY,
+                vector_value tsvector,
+                query_value tsquery,
+                vector_values tsvector[]
+            )",
+        ))?;
+        connection.execute(&QueryRequest::new(
+            "INSERT INTO text_search_display VALUES (
+                1,
+                setweight(to_tsvector('english', 'The quick brown fox'), 'A')
+                    || to_tsvector('english', 'jumps over it''s lazy dog'),
+                tsquery_phrase(
+                    to_tsquery('simple', 'fat:AB') || to_tsquery('simple', 'cat'),
+                    !! tsquery_phrase(
+                        to_tsquery('simple', 'rat'),
+                        to_tsquery('simple', 'dog')
+                    ),
+                    3
+                ) && to_tsquery('simple', 'bird:*'),
+                ARRAY[to_tsvector('english', 'first row'), NULL]
+            )",
+        ))?;
+
+        let result = connection.execute(&QueryRequest::new(
+            "SELECT
+                vector_value, vector_value::text,
+                query_value, query_value::text,
+                vector_values, array_to_json(vector_values)::text,
+                ''::tsvector, ''::tsvector::text,
+                NULL::tsvector, NULL::tsquery
+             FROM text_search_display",
+        ))?;
+        let row = &result.rows[0];
+
+        for (value_index, text_index) in [(0, 1), (2, 3), (6, 7)] {
+            assert_eq!(row[value_index], row[text_index]);
+        }
+        assert_text_array_matches_server_text(&row[4], &row[5]);
+        assert_eq!(row[8], Value::Null);
+        assert_eq!(row[9], Value::Null);
+
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Browse and count
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_browse_and_count() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE browse_test (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(50) NOT NULL
+            )",
+        ))?;
+
+        for i in 1..=25 {
+            connection.execute(&QueryRequest::new(format!(
+                "INSERT INTO browse_test (name) VALUES ('item_{}')",
+                i
+            )))?;
+        }
+
+        let table_ref = TableRef::with_schema("public", "browse_test");
+
+        let count = connection.count_table(&TableCountRequest::new(table_ref.clone()))?;
+        assert_eq!(count, 25);
+
+        let filtered_count = connection.count_table(
+            &TableCountRequest::new(table_ref.clone()).with_filter("name LIKE 'item_1%'"),
+        )?;
+        assert!(filtered_count > 0);
+        assert!(filtered_count < 25);
+
+        let page1 = connection.browse_table(
+            &TableBrowseRequest::new(table_ref.clone())
+                .with_pagination(Pagination::Offset {
+                    limit: 10,
+                    offset: 0,
+                })
+                .with_order_by(vec![OrderByColumn::asc("id")]),
+        )?;
+        assert_eq!(page1.rows.len(), 10);
+
+        let page2 = connection.browse_table(
+            &TableBrowseRequest::new(table_ref.clone())
+                .with_pagination(Pagination::Offset {
+                    limit: 10,
+                    offset: 10,
+                })
+                .with_order_by(vec![OrderByColumn::asc("id")]),
+        )?;
+        assert_eq!(page2.rows.len(), 10);
+        assert_ne!(page1.rows[0], page2.rows[0]);
+
+        let filtered = connection.browse_table(
+            &TableBrowseRequest::new(table_ref)
+                .with_filter("name = 'item_5'")
+                .with_pagination(Pagination::Offset {
+                    limit: 100,
+                    offset: 0,
+                }),
+        )?;
+        assert_eq!(filtered.rows.len(), 1);
+
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Explain and describe
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_explain() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE explain_test (id SERIAL PRIMARY KEY, name TEXT)",
+        ))?;
+
+        let table_ref = TableRef::with_schema("public", "explain_test");
+        let result = connection.explain(&ExplainRequest::new(table_ref))?;
+        assert!(!result.rows.is_empty() || result.text_body.is_some());
+
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_describe_table() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE describe_test (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                active BOOLEAN DEFAULT true
+            )",
+        ))?;
+
+        let table_ref = TableRef::with_schema("public", "describe_test");
+        let result = connection.describe_table(&DescribeRequest::new(table_ref))?;
+        assert!(result.rows.len() >= 3);
+
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Query cancellation
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_cancel_query() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        let cancel_handle = connection.cancel_handle();
+        let cancel_result = cancel_handle.cancel();
+        assert!(cancel_result.is_ok());
+
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Code generators
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_code_generators() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE codegen_test (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100) NOT NULL
+            )",
+        ))?;
+
+        let generators = connection.code_generators();
+        assert!(!generators.is_empty());
+
+        let table = connection.table_details("postgres", Some("public"), "codegen_test")?;
+
+        for generator in generators {
+            let code = connection.generate_code(&generator.id, &table)?;
+            assert!(
+                !code.is_empty(),
+                "generator '{}' returned empty code",
+                generator.id
+            );
+        }
+
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Document operations (should return NotSupported)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_document_ops_not_supported() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        let browse_result = connection.browse_collection(&dory_core::CollectionBrowseRequest::new(
+            CollectionRef::new("db", "col"),
+        ));
+        assert!(matches!(browse_result, Err(DbError::NotSupported(_))));
+
+        assert!(connection.key_value_api().is_none());
+
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Typed array literal emission (#76)
+//
+// Regression: prior to typed dialect plumbing, inserting/updating a `text[]`
+// or `int4[]` column emitted `'<json>'::jsonb`, which Postgres rejected with
+// `column "..." is of type text[] but expression is of type jsonb`.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_array_columns_round_trip() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE array_round_trip (
+                id SERIAL PRIMARY KEY,
+                tags TEXT[] NOT NULL,
+                scores INTEGER[] NOT NULL,
+                meta JSONB NOT NULL
+            )",
+        ))?;
+
+        // 1. Insert with Value::Array — simulates "round-trip from PG read,
+        //    untouched by the user" (the original #76 repro path).
+        let insert_array_form = RowInsert::with_typed_assignments(
+            "array_round_trip".to_string(),
+            Some("public".to_string()),
+            vec![
+                ColumnAssignment::typed(
+                    "tags",
+                    Value::Array(vec![
+                        Value::Text("Espacio".to_string()),
+                        Value::Text("hola".to_string()),
+                    ]),
+                    "_text",
+                ),
+                ColumnAssignment::typed(
+                    "scores",
+                    Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+                    "_int4",
+                ),
+                ColumnAssignment::typed("meta", Value::Json(r#"{"k":"v"}"#.to_string()), "jsonb"),
+            ],
+        );
+        let inserted = connection.insert_row(&insert_array_form)?;
+        assert_eq!(inserted.affected_rows, 1);
+
+        // 2. Insert with Value::Json(json-array-string) — simulates "user
+        //    edited the cell as JSON text in the data grid".
+        let insert_json_form = RowInsert::with_typed_assignments(
+            "array_round_trip".to_string(),
+            Some("public".to_string()),
+            vec![
+                ColumnAssignment::typed(
+                    "tags",
+                    Value::Json(r#"["foo","bar"]"#.to_string()),
+                    "_text",
+                ),
+                ColumnAssignment::typed("scores", Value::Json("[10, 20]".to_string()), "_int4"),
+                ColumnAssignment::typed(
+                    "meta",
+                    Value::Json(r#"{"edited":true}"#.to_string()),
+                    "jsonb",
+                ),
+            ],
+        );
+        let inserted = connection.insert_row(&insert_json_form)?;
+        assert_eq!(inserted.affected_rows, 1);
+
+        let rows = connection
+            .execute(&QueryRequest::new(
+                "SELECT tags, scores FROM array_round_trip ORDER BY id",
+            ))?
+            .rows;
+        assert_eq!(rows.len(), 2);
+
+        match &rows[0][0] {
+            Value::Array(arr) => {
+                assert_eq!(
+                    arr,
+                    &vec![
+                        Value::Text("Espacio".to_string()),
+                        Value::Text("hola".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected text[] array, got {:?}", other),
+        }
+        match &rows[0][1] {
+            Value::Array(arr) => {
+                assert_eq!(arr, &vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+            }
+            other => panic!("expected int4[] array, got {:?}", other),
+        }
+        match &rows[1][0] {
+            Value::Array(arr) => {
+                assert_eq!(
+                    arr,
+                    &vec![
+                        Value::Text("foo".to_string()),
+                        Value::Text("bar".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected text[] array from JSON form, got {:?}", other),
+        }
+
+        // 3. UPDATE with a typed Array assignment — same dialect path.
+        let update_result = connection.update_row(&RowPatch::with_typed_changes(
+            RecordIdentity::composite(vec!["id".to_string()], vec![Value::Int(1)]),
+            "array_round_trip".to_string(),
+            Some("public".to_string()),
+            vec![ColumnAssignment::typed(
+                "tags",
+                Value::Array(vec![Value::Text("updated".to_string())]),
+                "_text",
+            )],
+        ))?;
+        assert_eq!(update_result.affected_rows, 1);
+
+        let rows = connection
+            .execute(&QueryRequest::new(
+                "SELECT tags FROM array_round_trip WHERE id = 1",
+            ))?
+            .rows;
+        match &rows[0][0] {
+            Value::Array(arr) => {
+                assert_eq!(arr, &vec![Value::Text("updated".to_string())]);
+            }
+            other => panic!("expected updated text[] array, got {:?}", other),
+        }
+
+        // 4. Empty array round-trip.
+        let insert_empty = RowInsert::with_typed_assignments(
+            "array_round_trip".to_string(),
+            Some("public".to_string()),
+            vec![
+                ColumnAssignment::typed("tags", Value::Array(vec![]), "_text"),
+                ColumnAssignment::typed("scores", Value::Array(vec![]), "_int4"),
+                ColumnAssignment::typed("meta", Value::Json("{}".to_string()), "jsonb"),
+            ],
+        );
+        connection.insert_row(&insert_empty)?;
+
+        let rows = connection
+            .execute(&QueryRequest::new(
+                "SELECT tags, scores FROM array_round_trip ORDER BY id DESC LIMIT 1",
+            ))?
+            .rows;
+        assert!(matches!(&rows[0][0], Value::Array(arr) if arr.is_empty()));
+        assert!(matches!(&rows[0][1], Value::Array(arr) if arr.is_empty()));
+
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Typed array literal emission via semantic update/upsert (#76, MCP path)
+//
+// Exercises the SqlUpdateRequest / SqlUpsertRequest plumbing that the MCP
+// `update_records` and `upsert_record` tools go through, ensuring the typed
+// dialect path is reached and array columns succeed end-to-end.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_semantic_update_and_upsert_array_columns() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE semantic_array_test (
+                id INTEGER PRIMARY KEY,
+                tags TEXT[] NOT NULL,
+                meta JSONB NOT NULL
+            )",
+        ))?;
+
+        // Seed a row to update.
+        connection.insert_row(&RowInsert::with_typed_assignments(
+            "semantic_array_test".to_string(),
+            Some("public".to_string()),
+            vec![
+                ColumnAssignment::new("id", Value::Int(1)),
+                ColumnAssignment::typed(
+                    "tags",
+                    Value::Array(vec![Value::Text("a".to_string())]),
+                    "_text",
+                ),
+                ColumnAssignment::typed("meta", Value::Json("{}".to_string()), "jsonb"),
+            ],
+        ))?;
+
+        // Semantic UPDATE via SqlUpdateRequest::with_typed_changes — what the
+        // MCP `update_records` tool builds after resolve_column_types.
+        let filter = SemanticFilter::compare("id", WhereOperator::Eq, Value::Int(1));
+        let update = SqlUpdateRequest::with_typed_changes(
+            "semantic_array_test".to_string(),
+            Some("public".to_string()),
+            filter,
+            vec![ColumnAssignment::typed(
+                "tags",
+                Value::Array(vec![
+                    Value::Text("x".to_string()),
+                    Value::Text("y".to_string()),
+                ]),
+                "_text",
+            )],
+        );
+
+        connection.execute_semantic_request(&SemanticRequest::Mutation(
+            MutationRequest::sql_update_many(update),
+        ))?;
+
+        let rows = connection
+            .execute(&QueryRequest::new(
+                "SELECT tags FROM semantic_array_test WHERE id = 1",
+            ))?
+            .rows;
+        match &rows[0][0] {
+            Value::Array(arr) => {
+                assert_eq!(
+                    arr,
+                    &vec![Value::Text("x".to_string()), Value::Text("y".to_string())]
+                );
+            }
+            other => panic!("expected updated text[] array, got {:?}", other),
+        }
+
+        // Semantic UPSERT via SqlUpsertRequest::with_typed_assignments —
+        // exercises both insert-side and on-conflict-update typed literals.
+        let upsert = SqlUpsertRequest::with_typed_assignments(
+            "semantic_array_test".to_string(),
+            Some("public".to_string()),
+            vec![
+                ColumnAssignment::new("id", Value::Int(1)),
+                ColumnAssignment::typed(
+                    "tags",
+                    Value::Array(vec![Value::Text("upserted".to_string())]),
+                    "_text",
+                ),
+                ColumnAssignment::typed("meta", Value::Json(r#"{"v":2}"#.to_string()), "jsonb"),
+            ],
+            vec!["id".to_string()],
+            vec![ColumnAssignment::typed(
+                "tags",
+                Value::Array(vec![Value::Text("upserted".to_string())]),
+                "_text",
+            )],
+        );
+
+        connection.execute_semantic_request(&SemanticRequest::Mutation(
+            MutationRequest::sql_upsert(upsert),
+        ))?;
+
+        let rows = connection
+            .execute(&QueryRequest::new(
+                "SELECT tags FROM semantic_array_test WHERE id = 1",
+            ))?
+            .rows;
+        match &rows[0][0] {
+            Value::Array(arr) => {
+                assert_eq!(arr, &vec![Value::Text("upserted".to_string())]);
+            }
+            other => panic!("expected upserted text[] array, got {:?}", other),
+        }
+
+        // Also exercise an insert via upsert (new id, no conflict).
+        let upsert_new = SqlUpsertRequest::with_typed_assignments(
+            "semantic_array_test".to_string(),
+            Some("public".to_string()),
+            vec![
+                ColumnAssignment::new("id", Value::Int(2)),
+                ColumnAssignment::typed(
+                    "tags",
+                    Value::Array(vec![Value::Text("new".to_string())]),
+                    "_text",
+                ),
+                ColumnAssignment::typed("meta", Value::Json("{}".to_string()), "jsonb"),
+            ],
+            vec!["id".to_string()],
+            vec![],
+        );
+
+        connection.execute_semantic_request(&SemanticRequest::Mutation(
+            MutationRequest::sql_upsert(upsert_new),
+        ))?;
+
+        let rows = connection
+            .execute(&QueryRequest::new(
+                "SELECT tags FROM semantic_array_test WHERE id = 2",
+            ))?
+            .rows;
+        assert!(
+            matches!(&rows[0][0], Value::Array(arr) if arr == &vec![Value::Text("new".to_string())])
+        );
+
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Referential integrity toggle (data-transfer engine)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn postgres_set_referential_integrity_disables_and_restores_fk_checks() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let (connection, _) = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE parent_ri (id INT PRIMARY KEY)",
+        ))?;
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE child_ri (id INT PRIMARY KEY, parent_id INT REFERENCES parent_ri(id))",
+        ))?;
+
+        // With RI enabled (default), inserting a child with no matching parent fails.
+        let violates =
+            connection.execute(&QueryRequest::new("INSERT INTO child_ri VALUES (1, 999)"));
+        assert!(violates.is_err(), "FK violation must fail with RI enabled");
+
+        connection.set_referential_integrity(false)?;
+        connection.execute(&QueryRequest::new("INSERT INTO child_ri VALUES (1, 999)"))?;
+
+        connection.set_referential_integrity(true)?;
+        let still_violates =
+            connection.execute(&QueryRequest::new("INSERT INTO child_ri VALUES (2, 998)"));
+        assert!(
+            still_violates.is_err(),
+            "FK violation must fail again after RI is restored"
+        );
+
+        Ok(())
+    })
+}
