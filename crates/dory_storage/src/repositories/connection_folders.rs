@@ -699,12 +699,24 @@ impl ConnectionFoldersRepository {
                 }
             };
 
+            let mut name = folder.name;
+            if Self::is_root_folder_sentinel(&folder.id) && name != ROOT_FOLDER_SENTINEL_NAME {
+                if let Err(error) = self.conn().execute(
+                    "UPDATE cfg_connection_folders SET name = ?1 WHERE id = ?2",
+                    params![ROOT_FOLDER_SENTINEL_NAME, folder.id],
+                ) {
+                    warn!("Failed to normalize root folder name: {error}");
+                } else {
+                    name = ROOT_FOLDER_SENTINEL_NAME.to_string();
+                }
+            }
+
             let node = ConnectionTreeNode {
                 id: folder_id,
                 kind: ConnectionTreeNodeKind::Folder,
                 parent_id,
                 sort_index: folder.position,
-                name: folder.name,
+                name,
                 profile_id: None,
                 collapsed: folder.collapsed,
             };
