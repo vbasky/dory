@@ -206,7 +206,7 @@ impl Sidebar {
                         bucket_cache,
                     );
 
-                    if is_hidden_root_folder(&node.name) {
+                    if is_hidden_root_folder(node.id) {
                         items.extend(children);
                         continue;
                     }
@@ -2791,8 +2791,10 @@ fn build_schema_routines_folder(
 ///
 /// Multi-database drivers (Postgres, MySQL, MongoDB) are unaffected: with two
 /// or more databases the wrapper still discriminates between them.
-fn is_hidden_root_folder(name: &str) -> bool {
-    name == "__dory_root__" || name == "__dbflux_root__"
+/// Internal connections-tree root (`00000000-0000-0000-0000-000000000001`).
+/// Never shown as a sidebar row; its children are promoted to the tree root.
+fn is_hidden_root_folder(id: Uuid) -> bool {
+    id.as_u128() == 1
 }
 
 fn should_collapse_database_wrapper(
