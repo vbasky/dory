@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="resources/branding/stable/mark-256.png" alt="Dory" width="128" height="128">
+</p>
+
 # Dory
 
 **English** · [Español](README.es.md)
@@ -11,8 +15,6 @@ An extensible, keyboard-first data platform delivered as a Rust + GPUI desktop c
 Dory is an open-source desktop client with built-in drivers for relational and non-relational databases. Its core contracts are driver-neutral, and external drivers can integrate over RPC.
 
 The client focuses on performance, a clean UX, and keyboard-first workflows. The long-term goal is one fully open-source client for every database you work with.
-
-![Dory](resources/dory.png)
 
 ## Documentation
 
