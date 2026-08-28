@@ -206,6 +206,11 @@ impl Sidebar {
                         bucket_cache,
                     );
 
+                    if is_hidden_root_folder(&node.name) {
+                        items.extend(children);
+                        continue;
+                    }
+
                     let folder_item = TreeItem::new(
                         SchemaNodeId::ConnectionFolder { node_id: node.id }.to_string(),
                         node.name.clone(),
@@ -273,27 +278,6 @@ impl Sidebar {
             let is_time_series_db = schema.is_time_series();
             let conn_metadata = connected.connection.metadata();
             let conn_capabilities = conn_metadata.capabilities;
-
-            // Surface the per-profile Dashboards / Saved Charts folders only
-            // for drivers that opt in via `CHART_AUTHORING`. Drivers without
-            // a natural chart-authoring UX (e.g. plain relational stores) keep
-            // their sidebar focused on the native browsing model. Gating is
-            // purely capability-driven — no driver_id or category branching.
-            if conn_capabilities.contains(DriverCapabilities::CHART_AUTHORING) {
-                profile_children.push(Self::build_dashboards_folder_item(profile_id, state));
-                profile_children.push(Self::build_saved_charts_folder_item(profile_id, state));
-            }
-
-            // Drivers that can browse upstream dashboards get a read-only
-            // listing container. Capability-gated — no driver_id branching.
-            if conn_capabilities.contains(DriverCapabilities::DASHBOARD_SYNC) {
-                profile_children.push(Self::build_remote_dashboards_folder_item(
-                    profile_id,
-                    state,
-                    metric_fetch_errors,
-                ));
-            }
-
             let conn_category = conn_metadata.category;
             let supports_routines = conn_capabilities.contains(DriverCapabilities::ROUTINES);
             let metric_cache = state.metric_catalog_cache().clone();
@@ -334,8 +318,25 @@ impl Sidebar {
                         profile_children.extend(db_item.children);
                     }
                 } else if !named_items.is_empty() {
-                    profile_children
-                        .push(Self::build_databases_folder_item(profile_id, named_items));
+                    // Put the connected database's schemas (public / Tables / …)
+                    // directly under the profile so tables are visible without
+                    // opening Databases → postgres → public.
+                    let current_name = schema.current_database();
+                    let (current_items, other_items): (Vec<_>, Vec<_>) =
+                        named_items.into_iter().partition(|item| {
+                            matches!(
+                                parse_node_id(item.id.as_ref()),
+                                Some(SchemaNodeId::Database { name, .. })
+                                    if current_name == Some(name.as_str())
+                            )
+                        });
+                    for db_item in current_items {
+                        profile_children.extend(db_item.children);
+                    }
+                    if !other_items.is_empty() {
+                        profile_children
+                            .push(Self::build_databases_folder_item(profile_id, other_items));
+                    }
                 }
             } else {
                 // No databases defined - use active_database or first schema as fallback
@@ -345,7 +346,7 @@ impl Sidebar {
                     .or_else(|| schema.schemas().first().map(|s| s.name.as_str()))
                     .unwrap_or("default");
 
-                profile_children = Self::build_schema_children(
+                profile_children.extend(Self::build_schema_children(
                     profile_id,
                     database_name,
                     None,
@@ -357,10 +358,10 @@ impl Sidebar {
                     &connected.schema_routines,
                     supports_routines,
                     &connected.dependents_cache,
-                );
+                ));
             }
 
-            // Instance overview, metrics, and inspectors — appended after databases.
+            // Instance overview, metrics, and inspectors — after tables.
             // Sidebar order: Instance Overview, Instance Metrics, Instance Inspectors.
             // Capability-gated; no driver_id branching.
             profile_children.extend(build_instance_section(
@@ -370,7 +371,24 @@ impl Sidebar {
                 instance_inspectors_cache,
             ));
 
-            profile_item = profile_item.expanded(is_active).children(profile_children);
+            // Dashboards last so they do not bury tables on drivers that also
+            // advertise CHART_AUTHORING (e.g. Postgres instance metrics).
+            if conn_capabilities.contains(DriverCapabilities::CHART_AUTHORING) {
+                profile_children.push(Self::build_dashboards_folder_item(profile_id, state));
+                profile_children.push(Self::build_saved_charts_folder_item(profile_id, state));
+            }
+
+            if conn_capabilities.contains(DriverCapabilities::DASHBOARD_SYNC) {
+                profile_children.push(Self::build_remote_dashboards_folder_item(
+                    profile_id,
+                    state,
+                    metric_fetch_errors,
+                ));
+            }
+
+            profile_item = profile_item
+                .expanded(is_connected || is_active)
+                .children(profile_children);
         }
 
         profile_item
@@ -2773,6 +2791,10 @@ fn build_schema_routines_folder(
 ///
 /// Multi-database drivers (Postgres, MySQL, MongoDB) are unaffected: with two
 /// or more databases the wrapper still discriminates between them.
+fn is_hidden_root_folder(name: &str) -> bool {
+    name == "__dory_root__" || name == "__dbflux_root__"
+}
+
 fn should_collapse_database_wrapper(
     databases: &[dory_core::DatabaseInfo],
     strategy: SchemaLoadingStrategy,
