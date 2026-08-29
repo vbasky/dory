@@ -8,7 +8,7 @@
 
 Una plataforma de datos extensible y orientada al teclado, distribuida como un cliente de escritorio Rust + GPUI.
 
-**[dory.dev](https://dory.dev)** &middot; [Documentación](https://docs.dory.dev/) &middot; [Instalar](https://docs.dory.dev/install/)
+**[GitHub](https://github.com/vbasky/dory)** &middot; [Documentación](docs/es/USAGE.md) &middot; [Instalar](docs/es/INSTALL.md)
 
 ## Descripción general
 
@@ -18,9 +18,7 @@ El cliente se enfoca en rendimiento, una UX limpia y flujos de trabajo orientado
 
 ## Documentación
 
-Todo lo de abajo se publica en **[docs.dory.dev](https://docs.dory.dev/)**, renderizado a partir de
-estos mismos archivos, con búsqueda y un selector de versión. Los enlaces aquí apuntan a la fuente; léelos
-en el sitio si lo prefieres.
+Las guías de abajo viven en este repositorio. Todavía no hay un sitio de documentación separado.
 
 Elige el camino que corresponda a lo que quieres hacer.
 

@@ -8,7 +8,7 @@
 
 An extensible, keyboard-first data platform delivered as a Rust + GPUI desktop client.
 
-**[dory.dev](https://dory.dev)** &middot; [Documentation](https://docs.dory.dev/) &middot; [Install](https://docs.dory.dev/install/)
+**[GitHub](https://github.com/vbasky/dory)** &middot; [Documentation](docs/USAGE.md) &middot; [Install](docs/INSTALL.md)
 
 ## Overview
 
@@ -18,9 +18,7 @@ The client focuses on performance, a clean UX, and keyboard-first workflows. The
 
 ## Documentation
 
-Everything below is published at **[docs.dory.dev](https://docs.dory.dev/)**, rendered from
-these same files, with search and a version selector. The links here point at the source; read them
-on the site if you prefer.
+The guides below live in this repository. There is no separate documentation site yet.
 
 Choose the path that matches what you want to do.
 
