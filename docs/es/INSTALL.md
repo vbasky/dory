@@ -2,6 +2,15 @@
 
 ## Linux
 
+### Homebrew
+
+```bash
+brew tap vbasky/dory
+brew install dory
+```
+
+Esto compila desde el código fuente en Linux Homebrew. La primera instalación puede tardar.
+
 ### Tarball (recomendado)
 
 ```bash
@@ -114,6 +123,15 @@ NixOS / nix-darwin vía overlay:
 Dory para macOS no está firmado con un certificado de desarrollador de Apple.
 Al abrirlo por primera vez, verás una advertencia sobre un "desarrollador no
 identificado".
+
+### Homebrew
+
+```bash
+brew tap vbasky/dory
+brew install dory
+```
+
+Esto instala el binario `dory` (no un bundle `.app`) y lo compila desde el código fuente.
 
 ### Instalación
 

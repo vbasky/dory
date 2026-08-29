@@ -2,6 +2,15 @@
 
 ## Linux
 
+### Homebrew
+
+```bash
+brew tap vbasky/dory
+brew install dory
+```
+
+This builds from source on Linux Homebrew. The first install compiles the GUI and can take a while.
+
 ### Tarball (recommended)
 
 ```bash
@@ -107,6 +116,15 @@ NixOS / nix-darwin via overlay:
 ## macOS
 
 Dory for macOS is not signed with an Apple developer certificate. When opening for the first time, you'll see a warning about an "unidentified developer".
+
+### Homebrew
+
+```bash
+brew tap vbasky/dory
+brew install dory
+```
+
+This installs the `dory` binary (not a `.app` bundle) and builds from source.
 
 ### Installation
 

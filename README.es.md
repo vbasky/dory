@@ -70,11 +70,15 @@ las actualizaciones de traducción llegan como pull requests desde Weblate.
 ## Instalación
 
 ```bash
+# Homebrew (Linux y macOS)
+brew tap vbasky/dory
+brew install dory
+
 # Linux — instalar en /usr/local
 curl -fsSL https://raw.githubusercontent.com/vbasky/dory/main/scripts/install.sh | sudo bash
 ```
 
-Los paquetes para cada plataforma — tarball, AUR, `.deb`, `.rpm`, AppImage, Nix, DMG de
+Los paquetes para cada plataforma — tarball, AUR, `.deb`, `.rpm`, AppImage, Nix, Homebrew, DMG de
 macOS e instalador de Windows — están en la página de [Releases](https://github.com/vbasky/dory/releases).
 La guía completa, incluyendo los pasos de Gatekeeper y SmartScreen para los builds sin firmar
 de macOS y Windows, está en [Instalar Dory](docs/INSTALL.md).
